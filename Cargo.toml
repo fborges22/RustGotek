@@ -1,0 +1,9 @@
+[package]
+name = "rustgotek"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.87"
+description = "Manage Gotek USB media"
+license = "MIT"
+
+[dependencies]
