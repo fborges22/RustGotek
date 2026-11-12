@@ -373,7 +373,13 @@ impl Image {
     }
 }
 
-pub fn list(path: &Path, directory: &str) -> Result<()> {
+#[derive(Debug, Clone)]
+pub struct DiskEntry {
+    pub name: String,
+    pub directory: bool,
+    pub size: u64,
+}
+pub fn directory_entries(path: &Path, directory: &str) -> Result<Vec<DiskEntry>> {
     let image = Image::open(path)?;
     let cluster = if directory == "/" {
         None
@@ -384,7 +390,18 @@ pub fn list(path: &Path, directory: &str) -> Result<()> {
         }
         Some(entry.cluster)
     };
-    for entry in image.entries(cluster)? {
+    Ok(image
+        .entries(cluster)?
+        .into_iter()
+        .map(|entry| DiskEntry {
+            name: entry.name,
+            directory: entry.directory,
+            size: entry.size as u64,
+        })
+        .collect())
+}
+pub fn list(path: &Path, directory: &str) -> Result<()> {
+    for entry in directory_entries(path, directory)? {
         println!(
             "{:>10} {}{}",
             entry.size,

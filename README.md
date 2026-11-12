@@ -1,6 +1,6 @@
 # RustGotek
 
-Rust desktop application built with Iced for managing Gotek USB media and
+Rust desktop application built with egui for managing Gotek USB media and
 floppy images, with a command-line interface for the same operations. It
 supports original-firmware bank layouts, bank and whole-device backup/restore,
 FAT12 editing, HFE conversion, and FlashFloppy configuration/update staging.
@@ -14,23 +14,41 @@ cargo build --release
 ./target/release/rustgotek
 ```
 
-Launching without arguments (or with `gui`) opens the desktop interface. Use
-**Choose folder** to select the mounted USB directory. The sidebar provides
-media browsing and import/export, original-firmware disk banks, indexed slots, FAT12 and HFE image tools,
-backups, configuration, and firmware staging. Operations run asynchronously,
-and their results appear in the log with a copy button. File and folder inputs
-have native pickers; destructive media changes require confirmation.
+Launching without arguments (or with `gui`) opens the egui desktop interface.
 
-On Linux, read-only mounts are detected and media write actions are disabled.
-The USB media page takes a mount directory, not `/dev/sda`. The Disk banks
-page takes a raw device or whole-device image instead. A tiny FAT volume on a
-larger USB device exposes only one bank through the normal file browser.
-Directory backups do not capture other banks or boot sectors; use the whole-device
-backup operation on the Disk banks page for those.
+- **Image library:** choose a folder of disk images or mounted USB files. Search,
+  sort columns, select several images with checkboxes, import images, and export
+  the selection. Double-click a folder to navigate or a FAT12 disk to browse it.
+- **Create disk:** choose a destination and floppy capacity to make a formatted
+  FAT12 data disk. The new disk opens immediately for adding files.
+- **Disk contents:** browse directories, export files, add files, create folders,
+  rename and remove entries. Edits save a new image and open that copy so you can
+  continue editing. Files inside FAT12 disks use DOS 8.3 names.
+- **Gotek USB banks:** enter a raw device such as `/dev/sda` or choose a whole-device
+  backup, select the bank profile, and click **Scan banks**. Select banks to export
+  them individually or in batches. **Replace disk** takes a replacement image and
+  a new recovery path, then shows the target for review before writing.
+- **More tools:** image checks, HFE conversion, whole-device and folder backups,
+  restores, indexed slots, FlashFloppy configuration and firmware staging.
 
-The GUI uses Iced 0.14 with its software renderer, Tokio, and native dialogs
-through rfd. Linux requires a desktop session; native dialogs use its XDG
-portal service. CLI commands remain available without a display.
+Operations run on background threads. Results appear in the activity log with a
+copy button, and file/folder inputs have native pickers. Existing output files
+are never overwritten. Media changes such as bank replacement, full-device
+restore and moving an image to trash require a review and confirmation.
+
+On Linux, read-only mounts disable media write actions. The image library takes
+a directory; the bank workspace takes a raw device or whole-device image.
+A tiny FAT volume on a larger USB device exposes only one bank through the normal
+file browser. Folder backups do not capture other banks or boot sectors; use
+**More tools → Disk banks → Back up the whole device** for those.
+
+The GUI uses egui/eframe 0.33 with OpenGL rendering and native dialogs through
+rfd. Linux requires a desktop session; native dialogs use its XDG portal service.
+CLI commands remain available without a display. To launch in your bank workspace:
+
+```sh
+cargo run -- gui banks /dev/sda
+```
 
 On Windows the executable is `target\release\rustgotek.exe`. To install the
 command into your Cargo binary directory, use `cargo install --path . --locked`.
@@ -50,7 +68,7 @@ rustgotek bank-verify /dev/sda ./usb-full.bin
 rustgotek bank-replace ./usb-full.bin gotek1440 1 ./replacement.img ./usb-edited.bin
 ```
 
-The same operations are available on **Disk banks** in the GUI.
+The same operations are available under **Gotek USB banks → More tools** in the GUI.
 Open it with a source prefilled using `cargo run -- gui banks /dev/sda`.
 Linux raw reads
 use UDisks and the desktop authentication dialog if ordinary read permission is
@@ -75,10 +93,10 @@ free space. Keep the source unmounted or read-only and unchanged throughout
 backup and verification. Replacement requires a regular backup file and an
 exactly sized raw floppy image. It creates a new file, preserves padding and
 all other bytes, and reads back the changed bank. All output paths must be new.
-**Write a replacement to a bank** is available in the GUI with confirmation.
-Export the bank first, edit that image using Disk images, then choose the
-replacement, the exported original, and a new recovery image path. The CLI
-requires the explicit confirmation flag:
+**Replace disk** on a selected table row captures an expected original, saves a
+recovery image, writes the replacement and verifies it after confirmation. For an
+explicit expected-original file, use **More tools → Write a replacement to a bank**.
+The CLI requires the explicit confirmation flag:
 
 ```sh
 rustgotek bank-write /dev/sda gotek1440 1 ./replacement.img ./bank001.img ./bank001-recovery.img --confirm-write
@@ -399,8 +417,10 @@ cargo clippy --all-targets -- -D warnings
 The GitHub Actions workflow tests Linux, Windows and macOS, checks the minimum
 Rust version, and runs FAT interoperability tests on Linux. Adding this
 workflow does not establish those platforms as verified until its jobs pass.
-Local verification has been performed on Linux, including all 38 standard tests
-with Rust 1.92.0 and the locked dependencies. A distributable source
+Local verification has been performed on Linux. The egui migration includes
+headless rendering checks at two window sizes, bank table filtering/sorting,
+FAT12 directory data, and write-confirmation regression tests. The locked
+dependencies also compile with Rust 1.92.0. A distributable source
 archive can be built and verified with `cargo package --allow-dirty --offline`;
 this does not publish the crate.
 

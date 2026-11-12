@@ -159,20 +159,28 @@ fn copy_exact(source: &mut File, output: &mut File, length: u64) -> Result<()> {
     Ok(())
 }
 
-pub fn list(path: &Path, profile: &str) -> Result<()> {
+#[derive(Debug, Clone)]
+pub struct BankEntry {
+    pub number: u16,
+    pub offset: u64,
+    pub size: u64,
+    pub label: String,
+    pub status: String,
+    pub recognized: bool,
+}
+#[derive(Debug, Clone)]
+pub struct Catalog {
+    pub size: u64,
+    pub stride: u64,
+    pub payload: u64,
+    pub rows: Vec<BankEntry>,
+}
+pub fn catalog(path: &Path, profile: &str) -> Result<Catalog> {
     let layout = Profile::parse(profile)?;
     let (mut source, size) = open_source(path)?;
     layout.offset(0, size)?;
     let count = ((size - layout.payload) / layout.stride + 1).min(1000);
-    println!("Profile: {profile} (explicit, not auto-detected)");
-    println!(
-        "Source: {} bytes; stride: {}; payload: {}",
-        size, layout.stride, layout.payload
-    );
-    println!(
-        "Scanning {count} possible banks. Boot headers only; not a filesystem check or proof of device compatibility."
-    );
-    println!("BANK  OFFSET       HEADER                  BOOT LABEL");
+    let mut rows = Vec::new();
     for bank in 0..count {
         let offset = bank * layout.stride;
         source.seek(SeekFrom::Start(offset))?;
@@ -209,9 +217,38 @@ pub fn list(path: &Path, profile: &str) -> Result<()> {
         } else {
             String::new()
         };
+        rows.push(BankEntry {
+            number: bank as u16,
+            offset,
+            size: layout.payload,
+            label: label.trim_end().into(),
+            status: status.into(),
+            recognized: matching,
+        });
+    }
+    Ok(Catalog {
+        size,
+        stride: layout.stride,
+        payload: layout.payload,
+        rows,
+    })
+}
+pub fn list(path: &Path, profile: &str) -> Result<()> {
+    let catalog = catalog(path, profile)?;
+    println!("Profile: {profile} (explicit, not auto-detected)");
+    println!(
+        "Source: {} bytes; stride: {}; payload: {}",
+        catalog.size, catalog.stride, catalog.payload
+    );
+    println!(
+        "Scanning {} possible banks. Boot headers only; not a filesystem check or proof of device compatibility.",
+        catalog.rows.len()
+    );
+    println!("BANK  OFFSET       HEADER                  BOOT LABEL");
+    for entry in catalog.rows {
         println!(
-            "{bank:03}   {offset:010}   {status:23} {}",
-            label.trim_end()
+            "{:03}   {:010}   {:23} {}",
+            entry.number, entry.offset, entry.status, entry.label
         );
     }
     Ok(())
