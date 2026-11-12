@@ -1,8 +1,11 @@
 mod backup;
+mod banks;
 mod convert;
 mod fat12;
 mod firmware;
+mod gui;
 mod hfe;
+mod media;
 mod slots;
 
 use std::{
@@ -17,7 +20,21 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 const HELP: &str = "rustgotek — manage mounted Gotek USB media
 
 Commands:
+  gui                              Open the desktop interface (also the default)
+  gui banks [SOURCE]               Open Disk banks, optionally prefill the source
+  bank-list SOURCE PROFILE         Inspect fixed-stride bank boot headers
+  bank-create OUT PROFILE COUNT CAPACITY_BYTES|minimum
+                                   Create a new formatted bank-layout image
+  bank-export SOURCE PROFILE N OUT Export a raw floppy from bank N (0–999)
+  bank-backup SOURCE OUT            Copy the complete device/image to a new file
+  bank-verify SOURCE BACKUP         Compare every byte with a whole-device backup
+  bank-replace BACKUP PROFILE N IMG OUT  Replace a bank in a NEW backup file
+  bank-write TARGET PROFILE N IMG EXPECTED RECOVERY --confirm-write
+                                   Write one bank, save original and verify
+  device-restore TARGET IMAGE EXPECTED RECOVERY --confirm-write
+                                   Restore a whole device with recovery backup
   list ROOT                        List files recursively (links rejected)
+  media-info ROOT                  Report media configuration and image inventory
   import ROOT SOURCE NAME           Copy an image into the media
   slot ROOT SOURCE NUMBER|auto      Import to an indexed slot (0–999)
   slots ROOT                       Show indexed names, conflicts and next slot
@@ -46,7 +63,10 @@ Commands:
   image-remove PATH NAME OUT        Remove a file or empty directory to new image
   image-rename PATH NAME NEW OUT    Rename within its FAT12 directory to new image
 
-ROOT must be an existing mounted directory. No raw-device access or formatting.
+ROOT must be an existing mounted directory. Bank SOURCE can be a readable block
+device or a whole-device image. Profiles: gotek1440, gotek720 (explicit layout).
+bank-write and device-restore require an unmounted Linux device or image file,
+an expected original image, a new recovery path and --confirm-write.
 create-fat12 supports 360, 720, 1200, 1440, and 2880 KiB image files.
 Copies refuse overwrites. remove is recoverable through export from the trash.
 Configuration values are firmware-dependent; consult your firmware manual.
@@ -262,6 +282,53 @@ fn run(a: &[String]) -> Result<()> {
     match a.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
         [] | ["help"] | ["--help"] | ["-h"] => print!("{HELP}"),
         ["--version"] => println!("rustgotek {}", env!("CARGO_PKG_VERSION")),
+        ["bank-list", source, profile] => banks::list(Path::new(source), profile)?,
+        ["bank-create", dest, profile, count, capacity] => {
+            banks::create_layout(Path::new(dest), profile, count.parse()?, capacity)?
+        }
+        [
+            "device-restore",
+            target,
+            image,
+            expected,
+            recovery,
+            "--confirm-write",
+        ] => banks::restore_device(
+            Path::new(target),
+            Path::new(image),
+            Path::new(expected),
+            Path::new(recovery),
+        )?,
+        [
+            "bank-write",
+            target,
+            profile,
+            bank,
+            image,
+            expected,
+            recovery,
+            "--confirm-write",
+        ] => banks::write_bank(
+            Path::new(target),
+            profile,
+            bank.parse()?,
+            Path::new(image),
+            Path::new(expected),
+            Path::new(recovery),
+        )?,
+        ["bank-export", source, profile, bank, out] => {
+            banks::export(Path::new(source), profile, bank.parse()?, Path::new(out))?
+        }
+        ["bank-backup", source, out] => banks::backup(Path::new(source), Path::new(out))?,
+        ["bank-verify", source, backup] => banks::verify(Path::new(source), Path::new(backup))?,
+        ["bank-replace", source, profile, bank, image, out] => banks::replace(
+            Path::new(source),
+            profile,
+            bank.parse()?,
+            Path::new(image),
+            Path::new(out),
+        )?,
+        ["media-info", r] => media::info(&root(r)?)?,
         ["list", r] => {
             let base = root(r)?;
             let mut entries = vec![];
@@ -396,7 +463,17 @@ fn run(a: &[String]) -> Result<()> {
 }
 
 fn main() {
-    if let Err(e) = run(&env::args().skip(1).collect::<Vec<_>>()) {
+    let args: Vec<_> = env::args().skip(1).collect();
+    let bank_gui = (2..=3).contains(&args.len()) && args[0] == "gui" && args[1] == "banks";
+    if args.is_empty() || args == ["gui"] || bank_gui {
+        let source = bank_gui.then(|| args.get(2).cloned().unwrap_or_default());
+        if let Err(error) = gui::launch(source) {
+            eprintln!("rustgotek: {error}");
+            process::exit(1);
+        }
+        return;
+    }
+    if let Err(e) = run(&args) {
         eprintln!("rustgotek: {e}");
         process::exit(1);
     }

@@ -1,15 +1,36 @@
 # RustGotek
 
-Rust command-line utility for managing files on a Gotek's mounted USB stick.
-The current implementation provides media file management and FlashFloppy
-configuration. Full hardware-specific management is still under development.
+Rust desktop application built with Iced for managing Gotek USB media and
+floppy images, with a command-line interface for the same operations. It
+supports original-firmware bank layouts, bank and whole-device backup/restore,
+FAT12 editing, HFE conversion, and FlashFloppy configuration/update staging.
+Linux device access and the SFR1M44-U100K workflow have been tested; format
+and platform limitations are documented below.
 
-Build with Rust 1.87 or newer (no third-party Rust dependencies):
+Build with Rust 1.92 or newer:
 
 ```sh
 cargo build --release
-./target/release/rustgotek --help
+./target/release/rustgotek
 ```
+
+Launching without arguments (or with `gui`) opens the desktop interface. Use
+**Choose folder** to select the mounted USB directory. The sidebar provides
+media browsing and import/export, original-firmware disk banks, indexed slots, FAT12 and HFE image tools,
+backups, configuration, and firmware staging. Operations run asynchronously,
+and their results appear in the log with a copy button. File and folder inputs
+have native pickers; destructive media changes require confirmation.
+
+On Linux, read-only mounts are detected and media write actions are disabled.
+The USB media page takes a mount directory, not `/dev/sda`. The Disk banks
+page takes a raw device or whole-device image instead. A tiny FAT volume on a
+larger USB device exposes only one bank through the normal file browser.
+Directory backups do not capture other banks or boot sectors; use the whole-device
+backup operation on the Disk banks page for those.
+
+The GUI uses Iced 0.14 with its software renderer, Tokio, and native dialogs
+through rfd. Linux requires a desktop session; native dialogs use its XDG
+portal service. CLI commands remain available without a display.
 
 On Windows the executable is `target\release\rustgotek.exe`. To install the
 command into your Cargo binary directory, use `cargo install --path . --locked`.
@@ -17,10 +38,110 @@ Run `rustgotek --help` for the complete command list. Errors return exit code 1;
 successful operations return 0. Commands work on image files and mounted media
 directories; no administrative access is normally needed.
 
+Original-firmware bank workflow:
+
+```sh
+rustgotek bank-list /dev/sda gotek1440
+rustgotek bank-export /dev/sda gotek1440 1 ./bank001.img
+rustgotek image-check ./bank001.img
+rustgotek image-list ./bank001.img
+rustgotek bank-backup /dev/sda ./usb-full.bin
+rustgotek bank-verify /dev/sda ./usb-full.bin
+rustgotek bank-replace ./usb-full.bin gotek1440 1 ./replacement.img ./usb-edited.bin
+```
+
+The same operations are available on **Disk banks** in the GUI.
+Open it with a source prefilled using `cargo run -- gui banks /dev/sda`.
+Linux raw reads
+use UDisks and the desktop authentication dialog if ordinary read permission is
+missing. Read operations request a read-only device handle. The explicit bank-write
+and device-restore operations request exclusive read/write access. The GUI does not run as root
+or alter device permissions. Other systems can work with whole-device
+image files; raw Windows device paths are not supported yet.
+
+Profiles are explicit: `gotek1440` means 1440 KiB payloads at 1536 KiB intervals,
+and `gotek720` means 720 KiB payloads at 1024 KiB intervals. These are layout
+facts documented in [LibDsk's Gotek driver](https://fossies.org/linux/privat/libdsk-1.5.22/lib/drvgotek.c)
+and [GotekTool](https://github.com/sebmate/GotekTool). Confirm your model's
+layout: a matching first volume alone cannot identify the spacing. The report
+checks up to 1000 possible positions and marks matching boot headers, zero
+headers, and mismatches separately. It does not establish the number of disks
+supported by your firmware, validate FAT chains, or detect every legacy format.
+
+Export is byte-for-byte and supports non-FAT and damaged disks for recovery.
+Run image checks separately when applicable. Backup copies the **entire source
+capacity**, including gaps and trailing bytes; the destination needs that much
+free space. Keep the source unmounted or read-only and unchanged throughout
+backup and verification. Replacement requires a regular backup file and an
+exactly sized raw floppy image. It creates a new file, preserves padding and
+all other bytes, and reads back the changed bank. All output paths must be new.
+**Write a replacement to a bank** is available in the GUI with confirmation.
+Export the bank first, edit that image using Disk images, then choose the
+replacement, the exported original, and a new recovery image path. The CLI
+requires the explicit confirmation flag:
+
+```sh
+rustgotek bank-write /dev/sda gotek1440 1 ./replacement.img ./bank001.img ./bank001-recovery.img --confirm-write
+```
+
+The target must still match the exported original. Before writing, RustGotek
+saves, syncs and verifies the recovery image. It writes only the selected
+payload, syncs it and checks every byte on read-back. Detected write failures
+trigger an attempt to restore and verify the original bank; the recovery file
+is retained even if that attempt fails. Power loss or removal can prevent
+recovery, so keep that file. To undo a successful write, use the saved recovery
+image as the replacement and the currently installed image as the expected
+original, with a different new recovery path.
+
+Linux raw writes request `O_EXCL` and reject mounted/in-use devices, as defined
+by [open(2)](https://man7.org/linux/man-pages/man2/open.2.html); RustGotek does
+not unmount them automatically. Regular image targets are exclusively locked
+against cooperating writers. All raw-device operations other than bank-write and device-restore remain read-only.
+**Restore a whole-device image** restores every byte, including bank gaps
+and trailing data. It requires the same explicit confirmation, plus matching
+replacement and expected-original image sizes:
+
+```sh
+rustgotek device-restore /dev/sda ./usb-edited.bin ./usb-full.bin ./usb-recovery.bin --confirm-write
+```
+
+The destination capacity must exactly match the image; neither truncation nor
+partial restoration is allowed. The target is compared against the expected
+backup before writing. A new full recovery copy is saved, synced and checked,
+then the replacement is streamed and compared with the target. Memory use is
+bounded independently of device capacity. Input images have shared locks and
+the target has exclusive access; do not modify these files with other tools.
+A detected failure attempts a full restore from the recovery file. Keep enough
+free space for that file and retain it if recovery fails or power is lost.
+**Create a new bank layout** creates a new image containing 1–1000 blank
+FAT12 disks. Choose a bank count supported by your firmware. Each bank has a
+unique serial and matching boot/root labels `FDISK000`, `FDISK001`, and so on.
+No operating system is included. The selected fixed-stride profile determines
+disk capacity and spacing; all gaps and unused capacity are zero.
+
+```sh
+rustgotek bank-create ./new-layout.bin gotek1440 100 minimum
+rustgotek bank-list ./new-layout.bin gotek1440
+```
+
+For restoration onto a USB, replace `minimum` with its exact byte capacity from
+`bank-list`; the capacity must be a multiple of 512 and large enough for all
+banks, including the final gap. The output may use sparse storage but reads as
+the full specified capacity. Creating this image never opens a USB device.
+Inspect/export its disks before deploying it with the confirmed restore action
+and an expected-original backup. Existing output files are never overwritten.
+
+The layout uses FAT12 volumes at fixed offsets, with no partition table or
+extra selector metadata. This follows the formatting approach used by
+[usbfd](https://github.com/dennisMe2/usbfd/blob/master/usbfd); other Gotek firmware
+layouts are not inferred. Generated disks pass independent FAT checks, but
+acceptance by your emulator still requires a hardware test.
+
 Example workflow (replace `/media/USB` with the mounted USB directory):
 
 ```sh
 rustgotek list /media/USB
+rustgotek media-info /media/USB
 rustgotek backup /media/USB ./usb-backup
 rustgotek verify /media/USB ./usb-backup
 rustgotek init /media/USB indexed
@@ -31,6 +152,19 @@ rustgotek export /media/USB DSKA0000.img ./saved.img
 rustgotek remove /media/USB DSKA0000.img
 rustgotek restore ./usb-backup ./restored-usb
 ```
+
+`media-info ROOT` produces a read-only diagnostic report: image filename
+counts, root update entries, the active FlashFloppy configuration path and
+selected option lines, known selector/configuration files, and indexed-slot
+conflicts. It notes a root `FF.CFG` ignored by an `FF/` directory. Counts include
+hidden and trash directories; image content is not validated. Configuration
+lines are shown as written, including any inline comments.
+
+Files do not prove which firmware is installed: both FlashFloppy and HxC may
+use HxC-related files, and settings can persist in device flash without a
+configuration file. For hardware-specific support, provide this report
+together with the Gotek's startup display/firmware version, model or MCU,
+host computer/instrument, and desktop OS.
 
 `init` requires that no active configuration already exists. Configuration
 commands use `FF/FF.CFG` when `FF/` exists, otherwise `FF.CFG` in the root.
@@ -265,7 +399,8 @@ cargo clippy --all-targets -- -D warnings
 The GitHub Actions workflow tests Linux, Windows and macOS, checks the minimum
 Rust version, and runs FAT interoperability tests on Linux. Adding this
 workflow does not establish those platforms as verified until its jobs pass.
-Local verification has been performed on Linux. A distributable source
+Local verification has been performed on Linux, including all 38 standard tests
+with Rust 1.92.0 and the locked dependencies. A distributable source
 archive can be built and verified with `cargo package --allow-dirty --offline`;
 this does not publish the crate.
 
@@ -277,6 +412,7 @@ image. Run it when those tools are installed:
 ```sh
 cargo test fat12_external_interoperability -- --ignored
 cargo test long_name_removal_is_compatible_with_mtools -- --ignored
+cargo test created_banks_external_interoperability -- --ignored
 ```
 
 The HFE round-trip test additionally requires Greaseweazle's `gw` executable
@@ -285,3 +421,20 @@ on PATH (or set `RUSTGOTEK_GW` to its path):
 ```sh
 cargo test hfe_conversion_external_roundtrip -- --ignored
 ```
+
+The opt-in Linux device-write integration test needs UDisks and a desktop
+authorization agent. It creates a temporary loop device, checks mounted-write
+rejection, writes one bank and restores the full device, verifies recovery and unchanged neighboring bytes,
+and detaches the device afterward. It never selects a physical USB drive:
+
+```sh
+cargo build --locked
+python3 tests/linux-loop-check.py
+```
+
+This loop-device test has passed locally. Physical bank read/write and recovery
+were also verified on an SFR1M44-U100K USB. The user read a generated test file
+through the Gotek on a P3B-F/Pentium II running MS-DOS, then wrote RGREPLY.TXT
+to A:. RustGotek extracted the expected reply from the returned USB. Bank 99
+was restored to its saved original and independently compared byte-for-byte
+using the release build. No extra save-button procedure was needed.

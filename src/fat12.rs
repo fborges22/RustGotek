@@ -11,6 +11,22 @@ fn word(bytes: &[u8], offset: usize) -> usize {
 
 /// Create a data floppy, with no operating system boot loader.
 pub fn create(path: &Path, kib: usize) -> Result<()> {
+    let data = formatted_image(kib)?;
+    let mut f = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    let result = f.write_all(&data).and_then(|()| f.sync_all());
+    if result.is_err() {
+        drop(f);
+        let _ = fs::remove_file(path);
+    }
+    result?;
+    Ok(())
+}
+
+/// Shared formatter for standalone images and fixed-stride bank layouts.
+pub fn formatted_image(kib: usize) -> Result<Vec<u8>> {
     let (cluster, roots, fatsz, sectors_per_track, media) = match kib {
         360 => (2, 112, 2, 9, 0xfd),
         720 => (2, 112, 3, 9, 0xf9),
@@ -50,17 +66,7 @@ pub fn create(path: &Path, kib: usize) -> Result<()> {
         data[sector * 512..sector * 512 + 3].copy_from_slice(&[media, 0xff, 0xff]);
     }
     inspect(&data)?;
-    let mut f = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)?;
-    let result = f.write_all(&data).and_then(|()| f.sync_all());
-    if result.is_err() {
-        drop(f);
-        let _ = fs::remove_file(path);
-    }
-    result?;
-    Ok(())
+    Ok(data)
 }
 
 #[derive(Debug)]

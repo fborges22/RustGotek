@@ -7,6 +7,43 @@ use std::{
 static ID: AtomicUsize = AtomicUsize::new(0);
 
 #[test]
+fn media_report_distinguishes_files_from_installed_firmware() {
+    let s = Sandbox::new();
+    fs::create_dir_all(s.0.join("usb/ff")).unwrap();
+    fs::write(s.0.join("usb/FF.CFG"), "nav-mode = native\n").unwrap();
+    let config = "nav-mode = indexed\nhost = unspecified\nindexed-prefix = \"DISK\"\n";
+    fs::write(s.0.join("usb/ff/ff.cfg"), config).unwrap();
+    fs::write(s.0.join("usb/DISK0001.img"), b"image").unwrap();
+    fs::write(s.0.join("usb/disk0001_other.hfe"), b"other").unwrap();
+    fs::write(s.0.join("usb/HXCSDFE.CFG"), b"marker").unwrap();
+    let result = s.run(&["media-info", "usb"]);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let text = String::from_utf8_lossy(&result.stdout);
+    for expected in [
+        "Recognized image filenames: 2",
+        "nav-mode: indexed",
+        "root FF.CFG is ignored",
+        "Present: HXCSDFE.CFG",
+        "1 conflicts",
+        "does not identify installed firmware",
+    ] {
+        assert!(text.contains(expected), "{text}");
+    }
+    assert_eq!(
+        fs::read_to_string(s.0.join("usb/ff/ff.cfg")).unwrap(),
+        config
+    );
+    fs::create_dir(s.0.join("empty")).unwrap();
+    let result = s.run(&["media-info", "empty"]);
+    assert!(result.status.success());
+    assert!(String::from_utf8_lossy(&result.stdout).contains("configuration: absent"));
+}
+
+#[test]
 fn raw_to_hfe_profiles_and_size_checks() {
     let s = Sandbox::new();
     for (profile, size) in [
@@ -1102,4 +1139,417 @@ fn linked_paths_are_rejected() {
     );
     assert!(!s.run(&["backup", "usb", "backup"]).status.success());
     assert!(!s.0.join("outside/escape.img").exists());
+}
+
+#[test]
+fn legacy_banks_preserve_padding_and_unselected_data() {
+    for (profile, kib, stride) in [("gotek1440", 1440, 0x180000), ("gotek720", 720, 0x100000)] {
+        let s = Sandbox::new();
+        s.ok(&["create-fat12", "floppy.img", &kib.to_string()]);
+        let floppy = fs::read(s.0.join("floppy.img")).unwrap();
+        // Nonzero gap and tail bytes detect accidentally copying contiguous
+        // floppy lengths instead of the independent on-device bank stride.
+        let mut original = vec![0xa5; 3 * stride + 79];
+        for n in 0..3 {
+            original[n * stride..n * stride + floppy.len()].copy_from_slice(&floppy);
+        }
+        fs::write(s.0.join("device.bin"), &original).unwrap();
+        let report = s.run(&["bank-list", "device.bin", profile]);
+        assert!(report.status.success());
+        let report = String::from_utf8_lossy(&report.stdout);
+        assert!(report.contains("Scanning 3 possible banks"), "{report}");
+        assert_eq!(report.matches("Matching FAT BPB").count(), 3);
+        s.ok(&["bank-export", "device.bin", profile, "1", "export.img"]);
+        assert_eq!(fs::read(s.0.join("export.img")).unwrap(), floppy);
+        s.ok(&["image-check", "export.img"]);
+        s.ok(&["bank-backup", "device.bin", "backup.bin"]);
+        assert_eq!(fs::read(s.0.join("backup.bin")).unwrap(), original);
+        s.ok(&["bank-verify", "device.bin", "backup.bin"]);
+        let replacement = vec![0x34; floppy.len()]; // Non-FAT raw floppy supported.
+        fs::write(s.0.join("replacement.img"), &replacement).unwrap();
+        s.ok(&[
+            "bank-replace",
+            "backup.bin",
+            profile,
+            "1",
+            "replacement.img",
+            "edited.bin",
+        ]);
+        let mut expected = original.clone();
+        expected[stride..stride + replacement.len()].copy_from_slice(&replacement);
+        assert_eq!(fs::read(s.0.join("edited.bin")).unwrap(), expected);
+        assert_eq!(fs::read(s.0.join("backup.bin")).unwrap(), original);
+        assert_eq!(fs::read(s.0.join("device.bin")).unwrap(), original);
+        let mismatch = s.run(&["bank-verify", "device.bin", "edited.bin"]);
+        assert!(!mismatch.status.success());
+        assert!(String::from_utf8_lossy(&mismatch.stderr).contains(&format!("byte {stride}")));
+        for args in [
+            vec!["bank-export", "device.bin", profile, "3", "bad.img"],
+            vec!["bank-export", "device.bin", profile, "1000", "bad.img"],
+            vec!["bank-export", "device.bin", "unknown", "0", "bad.img"],
+            vec!["bank-export", "device.bin", profile, "-1", "bad.img"],
+            vec![
+                "bank-replace",
+                "device.bin",
+                profile,
+                "0",
+                "device.bin",
+                "bad.img",
+            ],
+            vec!["bank-backup", "device.bin", "device.bin"],
+            vec!["bank-export", "device.bin", profile, "1", "export.img"],
+            vec![
+                "bank-replace",
+                "backup.bin",
+                profile,
+                "0",
+                "replacement.img",
+                "backup.bin",
+            ],
+        ] {
+            assert!(!s.run(&args).status.success(), "{args:?}");
+            assert!(!s.0.join("bad.img").exists());
+        }
+        assert_eq!(fs::read(s.0.join("device.bin")).unwrap(), original);
+        assert_eq!(fs::read(s.0.join("backup.bin")).unwrap(), original);
+    }
+}
+
+#[test]
+fn legacy_bank_scan_handles_zero_headers_and_truncated_payloads() {
+    let s = Sandbox::new();
+    let mut image = vec![0; 0x180000 + 1440 * 1024 - 1];
+    fs::write(s.0.join("partial.bin"), &image).unwrap();
+    let result = s.run(&["bank-list", "partial.bin", "gotek1440"]);
+    assert!(result.status.success());
+    let text = String::from_utf8_lossy(&result.stdout);
+    assert!(text.contains("Scanning 1 possible banks"));
+    assert!(text.contains("Zero boot sector"));
+    assert!(
+        !s.run(&["bank-export", "partial.bin", "gotek1440", "1", "bad.img"])
+            .status
+            .success()
+    );
+    assert!(!s.0.join("bad.img").exists());
+    image.push(0);
+    fs::write(s.0.join("complete.bin"), &image).unwrap();
+    s.ok(&["bank-export", "complete.bin", "gotek1440", "1", "last.img"]);
+    assert_eq!(
+        fs::metadata(s.0.join("last.img")).unwrap().len(),
+        1440 * 1024
+    );
+    fs::write(s.0.join("short.bin"), [0; 511]).unwrap();
+    assert!(
+        !s.run(&["bank-list", "short.bin", "gotek1440"])
+            .status
+            .success()
+    );
+    assert!(
+        !s.run(&["bank-verify", "complete.bin", "short.bin"])
+            .status
+            .success()
+    );
+}
+
+#[test]
+fn bank_write_requires_confirmation_and_matching_original_and_saves_recovery() {
+    for (profile, length, stride) in [
+        ("gotek1440", 1440 * 1024, 0x180000),
+        ("gotek720", 720 * 1024, 0x100000),
+    ] {
+        let s = Sandbox::new();
+        let before = vec![0x32; stride * 3 + 47];
+        fs::write(s.0.join("target.bin"), &before).unwrap();
+        fs::write(s.0.join("replacement.img"), vec![0x65; length]).unwrap();
+        s.ok(&["bank-export", "target.bin", profile, "1", "original.img"]);
+        let args = [
+            "bank-write",
+            "target.bin",
+            profile,
+            "1",
+            "replacement.img",
+            "original.img",
+            "recovery.img",
+            "--confirm-write",
+        ];
+        assert!(!s.run(&args[..7]).status.success());
+        assert_eq!(fs::read(s.0.join("target.bin")).unwrap(), before);
+        assert!(!s.0.join("recovery.img").exists());
+        // Existing recovery paths and stale expectations must fail before writing.
+        fs::write(s.0.join("recovery.img"), b"keep").unwrap();
+        assert!(!s.run(&args).status.success());
+        assert_eq!(fs::read(s.0.join("recovery.img")).unwrap(), b"keep");
+        assert_eq!(fs::read(s.0.join("target.bin")).unwrap(), before);
+        fs::remove_file(s.0.join("recovery.img")).unwrap();
+        fs::write(s.0.join("wrong.img"), vec![0x99; length]).unwrap();
+        let mut wrong = args;
+        wrong[5] = "wrong.img";
+        assert!(!s.run(&wrong).status.success());
+        assert!(!s.0.join("recovery.img").exists());
+        assert_eq!(fs::read(s.0.join("target.bin")).unwrap(), before);
+        wrong = args;
+        wrong[3] = "1000";
+        assert!(!s.run(&wrong).status.success());
+        wrong[3] = "3";
+        assert!(!s.run(&wrong).status.success());
+        wrong = args;
+        wrong[4] = "wrong-size.img";
+        fs::write(s.0.join("wrong-size.img"), b"too small").unwrap();
+        assert!(!s.run(&wrong).status.success());
+        assert_eq!(fs::read(s.0.join("target.bin")).unwrap(), before);
+        s.ok(&args);
+        let after = fs::read(s.0.join("target.bin")).unwrap();
+        assert_eq!(&after[..stride], &before[..stride]);
+        assert_eq!(&after[stride..stride + length], vec![0x65; length]);
+        assert_eq!(&after[stride + length..], &before[stride + length..]);
+        assert_eq!(
+            fs::read(s.0.join("recovery.img")).unwrap(),
+            vec![0x32; length]
+        );
+        // Stale original blocks a repeated write even with a fresh recovery path.
+        wrong = args;
+        wrong[6] = "second-recovery.img";
+        assert!(!s.run(&wrong).status.success());
+        assert!(!s.0.join("second-recovery.img").exists());
+        // The saved original is usable for a verified restore of this bank.
+        s.ok(&[
+            "bank-write",
+            "target.bin",
+            profile,
+            "1",
+            "recovery.img",
+            "replacement.img",
+            "undo-recovery.img",
+            "--confirm-write",
+        ]);
+        assert_eq!(fs::read(s.0.join("target.bin")).unwrap(), before);
+    }
+}
+
+#[test]
+fn bank_write_refuses_locked_images() {
+    let s = Sandbox::new();
+    fs::write(s.0.join("target.bin"), vec![0; 1440 * 1024]).unwrap();
+    fs::write(s.0.join("replacement.img"), vec![1; 1440 * 1024]).unwrap();
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(s.0.join("target.bin"))
+        .unwrap();
+    file.lock().unwrap();
+    let result = s.run(&[
+        "bank-write",
+        "target.bin",
+        "gotek1440",
+        "0",
+        "replacement.img",
+        "target.bin",
+        "recovery.img",
+        "--confirm-write",
+    ]);
+    assert!(!result.status.success());
+    assert!(!s.0.join("recovery.img").exists());
+    drop(file);
+    assert_eq!(
+        fs::read(s.0.join("target.bin")).unwrap(),
+        vec![0; 1440 * 1024]
+    );
+}
+
+#[test]
+fn full_device_restore_preserves_recovery_and_checks_every_byte() {
+    let s = Sandbox::new();
+    let size = 3 * 1024 * 1024 + 79; // crosses streaming chunks; non-aligned tail
+    let before: Vec<u8> = (0..size).map(|n| (n % 251) as u8).collect();
+    let mut replacement = before.clone();
+    replacement[0] ^= 0xff;
+    replacement[1024 * 1024 + 7] ^= 0xff;
+    replacement[size - 1] ^= 0xff;
+    fs::write(s.0.join("target.bin"), &before).unwrap();
+    fs::write(s.0.join("expected.bin"), &before).unwrap();
+    fs::write(s.0.join("replacement.bin"), &replacement).unwrap();
+    let args = [
+        "device-restore",
+        "target.bin",
+        "replacement.bin",
+        "expected.bin",
+        "recovery.bin",
+        "--confirm-write",
+    ];
+    assert!(!s.run(&args[..5]).status.success());
+    assert_eq!(fs::read(s.0.join("target.bin")).unwrap(), before);
+    fs::write(s.0.join("recovery.bin"), b"keep").unwrap();
+    assert!(!s.run(&args).status.success());
+    assert_eq!(fs::read(s.0.join("recovery.bin")).unwrap(), b"keep");
+    assert_eq!(fs::read(s.0.join("target.bin")).unwrap(), before);
+    fs::remove_file(s.0.join("recovery.bin")).unwrap();
+    // Wrong expectation, source sizes and aliases all fail before target writes.
+    for (index, value) in [(3, "replacement.bin"), (2, "target.bin"), (3, "target.bin")] {
+        let mut invalid = args;
+        invalid[index] = value;
+        assert!(!s.run(&invalid).status.success(), "{invalid:?}");
+        assert_eq!(fs::read(s.0.join("target.bin")).unwrap(), before);
+        assert!(!s.0.join("recovery.bin").exists());
+    }
+    fs::write(s.0.join("small.bin"), &before[..size - 1]).unwrap();
+    let mut invalid = args;
+    invalid[2] = "small.bin";
+    assert!(!s.run(&invalid).status.success());
+    invalid[3] = "small.bin";
+    assert!(!s.run(&invalid).status.success());
+    s.ok(&args);
+    assert_eq!(fs::read(s.0.join("target.bin")).unwrap(), replacement);
+    assert_eq!(fs::read(s.0.join("recovery.bin")).unwrap(), before);
+    assert_eq!(fs::read(s.0.join("expected.bin")).unwrap(), before);
+    assert_eq!(fs::read(s.0.join("replacement.bin")).unwrap(), replacement);
+    s.ok(&[
+        "device-restore",
+        "target.bin",
+        "recovery.bin",
+        "replacement.bin",
+        "undo.bin",
+        "--confirm-write",
+    ]);
+    assert_eq!(fs::read(s.0.join("target.bin")).unwrap(), before);
+    assert_eq!(fs::read(s.0.join("undo.bin")).unwrap(), replacement);
+}
+
+#[test]
+fn bank_layout_creation_formats_distinct_disks_and_zeroes_gaps() {
+    for (profile, payload, stride) in [
+        ("gotek1440", 1440 * 1024, 0x180000),
+        ("gotek720", 720 * 1024, 0x100000),
+    ] {
+        let s = Sandbox::new();
+        let capacity = 3 * stride + 1024;
+        s.ok(&[
+            "bank-create",
+            "new.bin",
+            profile,
+            "3",
+            &capacity.to_string(),
+        ]);
+        let data = fs::read(s.0.join("new.bin")).unwrap();
+        assert_eq!(data.len(), capacity);
+        let mut serials = std::collections::BTreeSet::new();
+        for bank in 0..3 {
+            let offset = bank * stride;
+            let floppy = format!("bank{bank}.img");
+            s.ok(&[
+                "bank-export",
+                "new.bin",
+                profile,
+                &bank.to_string(),
+                &floppy,
+            ]);
+            s.ok(&["image-check", &floppy]);
+            let bytes = fs::read(s.0.join(&floppy)).unwrap();
+            assert_eq!(bytes.len(), payload);
+            let label = format!("FDISK{bank:03}   ");
+            assert_eq!(&bytes[43..54], label.as_bytes());
+            let word = |at| u16::from_le_bytes([bytes[at], bytes[at + 1]]) as usize;
+            let root = (word(14) + bytes[16] as usize * word(22)) * 512;
+            assert_eq!(&bytes[root..root + 11], label.as_bytes());
+            assert_eq!(bytes[root + 11], 8);
+            assert!(serials.insert(bytes[39..43].to_vec()));
+            assert!(
+                data[offset + payload..offset + stride]
+                    .iter()
+                    .all(|b| *b == 0)
+            );
+        }
+        assert!(data[3 * stride..].iter().all(|b| *b == 0));
+        let report = s.run(&["bank-list", "new.bin", profile]);
+        assert!(report.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&report.stdout)
+                .matches("Matching FAT BPB")
+                .count(),
+            3
+        );
+        // Generated banks support the normal file-edit workflow.
+        fs::write(s.0.join("hello.txt"), b"new bank test").unwrap();
+        s.ok(&[
+            "image-import",
+            "bank1.img",
+            "hello.txt",
+            "HELLO.TXT",
+            "edited.img",
+        ]);
+        s.ok(&["image-check", "edited.img"]);
+        s.ok(&[
+            "bank-replace",
+            "new.bin",
+            profile,
+            "1",
+            "edited.img",
+            "ready.bin",
+        ]);
+        s.ok(&["bank-export", "ready.bin", profile, "1", "again.img"]);
+        s.ok(&["image-extract", "again.img", "HELLO.TXT", "readback.txt"]);
+        assert_eq!(
+            fs::read(s.0.join("readback.txt")).unwrap(),
+            b"new bank test"
+        );
+        s.ok(&["bank-create", "minimum.bin", profile, "1", "minimum"]);
+        assert_eq!(
+            fs::metadata(s.0.join("minimum.bin")).unwrap().len(),
+            stride as u64
+        );
+        assert!(
+            !s.run(&["bank-create", "new.bin", profile, "1", "minimum"])
+                .status
+                .success()
+        );
+        assert_eq!(fs::read(s.0.join("new.bin")).unwrap(), data);
+        for (count, size) in [
+            ("0", "minimum"),
+            ("1001", "minimum"),
+            ("-1", "minimum"),
+            ("3", "512"),
+            ("1", "2000001"),
+            ("1", "18446744073709551615"),
+        ] {
+            assert!(
+                !s.run(&["bank-create", "invalid.bin", profile, count, size])
+                    .status
+                    .success()
+            );
+            assert!(!s.0.join("invalid.bin").exists());
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires dosfstools and mtools on PATH"]
+fn created_banks_external_interoperability() {
+    let s = Sandbox::new();
+    for profile in ["gotek1440", "gotek720"] {
+        let whole = format!("{profile}.bin");
+        s.ok(&["bank-create", &whole, profile, "3", "minimum"]);
+        for bank in 0..3 {
+            let name = format!("{profile}-{bank}.img");
+            s.ok(&["bank-export", &whole, profile, &bank.to_string(), &name]);
+            let path = s.0.join(name);
+            let check = Command::new("fsck.fat")
+                .arg("-n")
+                .arg(&path)
+                .output()
+                .unwrap();
+            assert!(
+                check.status.success(),
+                "{} {}",
+                String::from_utf8_lossy(&check.stdout),
+                String::from_utf8_lossy(&check.stderr)
+            );
+            let listing = Command::new("mdir")
+                .arg("-i")
+                .arg(path)
+                .arg("::")
+                .output()
+                .unwrap();
+            assert!(listing.status.success());
+            assert!(String::from_utf8_lossy(&listing.stdout).contains(&format!("FDISK{bank:03}")));
+        }
+    }
 }

@@ -24,7 +24,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.87.0
+      - uses: dtolnay/rust-toolchain@1.92.0
       - run: cargo test --locked
   fat-interoperability:
     runs-on: ubuntu-latest
@@ -34,3 +34,4 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y dosfstools mtools
       - run: cargo test --locked fat12_external_interoperability -- --ignored
       - run: cargo test --locked long_name_removal_is_compatible_with_mtools -- --ignored
+      - run: cargo test --locked created_banks_external_interoperability -- --ignored
