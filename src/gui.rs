@@ -1,3 +1,4 @@
+mod visual;
 use eframe::egui::{self, Color32, RichText};
 use egui_extras::{Column, TableBuilder};
 use std::{
@@ -6,33 +7,21 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, mpsc},
 };
+use visual::Icon;
 
 pub fn launch(bank_source: Option<String>) -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 860.0])
-            .with_min_inner_size([900.0, 640.0]),
+            .with_min_inner_size([900.0, 640.0])
+            .with_icon(Arc::new(visual::app_icon())),
         ..Default::default()
     };
     eframe::run_native(
         "RustGotek — Disk workspace",
         options,
         Box::new(move |cc| {
-            cc.egui_ctx.set_visuals(egui::Visuals::dark());
-            let mut style = (*cc.egui_ctx.style()).clone();
-            style.spacing.item_spacing = egui::vec2(10.0, 10.0);
-            style.spacing.button_padding = egui::vec2(12.0, 7.0);
-            style.visuals.selection.bg_fill = Color32::from_rgb(33, 116, 106);
-            style.visuals.panel_fill = Color32::from_rgb(20, 27, 35);
-            for text_style in [egui::TextStyle::Body, egui::TextStyle::Button] {
-                style
-                    .text_styles
-                    .insert(text_style, egui::FontId::proportional(14.0));
-            }
-            style
-                .text_styles
-                .insert(egui::TextStyle::Small, egui::FontId::proportional(12.0));
-            cc.egui_ctx.set_style(style);
+            visual::apply(&cc.egui_ctx);
             Ok(Box::new(App::new(bank_source, &cc.egui_ctx)))
         }),
     )
@@ -47,40 +36,6 @@ enum Page {
     Config,
     Firmware,
 }
-impl Page {
-    const ALL: [Self; 7] = [
-        Self::Media,
-        Self::Banks,
-        Self::Slots,
-        Self::Images,
-        Self::Backups,
-        Self::Config,
-        Self::Firmware,
-    ];
-    fn title(self) -> &'static str {
-        match self {
-            Self::Media => "USB media",
-            Self::Banks => "Disk banks",
-            Self::Slots => "Indexed slots",
-            Self::Images => "Disk images",
-            Self::Backups => "Backups",
-            Self::Config => "Configuration",
-            Self::Firmware => "Firmware",
-        }
-    }
-    fn description(self) -> &'static str {
-        match self {
-            Self::Media => "Browse the files on your mounted Gotek USB drive.",
-            Self::Banks => "Inspect, export and replace original Gotek floppy banks.",
-            Self::Slots => "Manage FlashFloppy indexed image files. Not raw disk banks.",
-            Self::Images => "Create, inspect, edit and convert local floppy images.",
-            Self::Backups => "Preserve your files and verify every copied byte.",
-            Self::Config => "Inspect and edit FlashFloppy settings with automatic backups.",
-            Self::Firmware => "Validate update files and prepare USB media for a specific MCU.",
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy)]
 enum Kind {
     Text,
@@ -631,6 +586,7 @@ enum Event {
     Listed(Listing),
     Banks(crate::banks::Catalog, String, String),
     Preview(Preview),
+    Prepared(Form),
     Done(String),
     Edited(Preview, String),
     Picked(usize, Option<PathBuf>),
@@ -653,8 +609,6 @@ struct App {
     descending: bool,
     preview: Option<Preview>,
     form: Option<Form>,
-    tools: bool,
-    tool_page: Page,
     busy: bool,
     status: String,
     error: bool,
@@ -699,8 +653,6 @@ impl App {
             descending: false,
             preview: None,
             form: None,
-            tools: false,
-            tool_page: Page::Images,
             busy: false,
             status: "Open an image folder or scan your Gotek banks".into(),
             error: false,
@@ -801,6 +753,10 @@ impl App {
                     self.bank_identity = Some((source, profile));
                     self.selected
                         .retain(|k| self.rows.iter().any(|r| &r.key == k));
+                }
+                Ok(Event::Prepared(form)) => {
+                    self.form = Some(form);
+                    self.status = "Ready".into();
                 }
                 Ok(Event::Preview(preview)) => {
                     self.status = format!("{} entries in {}", preview.entries.len(), preview.title);
@@ -937,6 +893,16 @@ impl App {
         if let Some(op) = OPS.iter().find(|o| o.command == command) {
             let mut form = Form::operation(op);
             let selected = self.selection();
+            if command == "device-restore" {
+                form.values[0] = self.source.clone();
+            }
+            if command == "slot"
+                && let Some(row) = selected
+                    .first()
+                    .filter(|r| !r.directory && r.bank.is_none())
+            {
+                form.values[0] = row.path.to_string_lossy().into_owned();
+            }
             if command == "bank-create" {
                 form.values[1] = self.profile.clone();
             }
@@ -972,10 +938,16 @@ impl App {
                 form.values[0] = row.path.to_string_lossy().into_owned();
             }
             self.form = Some(form);
-            self.tools = false;
         }
     }
     fn open_disk(&mut self, ctx: &egui::Context, row: DiskRow) {
+        if row.is_hfe() {
+            let image = row.path.to_string_lossy().into_owned();
+            self.worker(ctx, "Inspecting HFE tracks…", move || {
+                backend(vec!["inspect-hfe".into(), image]).map(Event::Done)
+            });
+            return;
+        }
         if row.directory {
             let root = PathBuf::from(&self.root);
             self.selected.clear();
@@ -986,15 +958,9 @@ impl App {
         }
         let profile = self.profile.clone();
         self.worker(ctx, "Opening disk contents…", move || {
-            let (image, temp) = if let Some(bank) = row.bank {
-                let temp = Arc::new(tempfile::tempdir().map_err(|e| e.to_string())?);
-                let image = temp.path().join("disk.img");
-                backend(vec!["bank-export".into(), row.path.to_string_lossy().into_owned(), profile,
-                    bank.to_string(), image.to_string_lossy().into_owned()])?;
-                (image, Some(temp))
-            } else { (row.path, None) };
+            let (image, temp) = disk_snapshot(&row, &profile)?;
             let entries = crate::fat12::directory_entries(&image, "/").map_err(|e| {
-                format!("Cannot browse this disk as FAT12: {e}. Use Inspect / Convert under More tools for HFE or other formats.")
+                format!("Cannot browse this disk as FAT12: {e}. Use the Check or Convert toolbar menus for image inspection and conversion.")
             })?;
             Ok(Event::Preview(Preview { image, directory: "/".into(), entries, temp, selected: None, title: row.name }))
         });
@@ -1173,199 +1139,368 @@ impl eframe::App for App {
 impl App {
     fn ui(&mut self, ctx: &egui::Context) {
         self.receive(ctx);
-        egui::TopBottomPanel::top("heading").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.add_space(8.0);
-                ui.heading("RustGotek");
-                ui.label(
-                    RichText::new("DISK WORKSPACE")
-                        .small()
-                        .color(Color32::from_rgb(104, 199, 182)),
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if self.busy {
-                        ui.spinner();
-                    }
-                    ui.label(if self.busy { "Working" } else { "Ready" });
-                });
-            });
-        });
-        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.colored_label(
-                    if self.error {
-                        Color32::LIGHT_RED
-                    } else {
-                        Color32::from_rgb(119, 213, 189)
-                    },
-                    &self.status,
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.toggle_value(&mut self.show_log, "Activity log");
-                    if ui.button("Copy log").clicked() {
-                        ctx.copy_text(self.log.clone());
-                    }
-                });
-            });
-            if self.show_log {
-                egui::ScrollArea::vertical()
-                    .max_height(115.0)
-                    .show(ui, |ui| {
-                        ui.add(
-                            egui::TextEdit::multiline(&mut self.log)
-                                .font(egui::TextStyle::Monospace)
-                                .desired_width(f32::INFINITY),
+        self.shortcuts(ctx);
+        egui::TopBottomPanel::top("brand")
+            .frame(
+                egui::Frame::new()
+                    .fill(Color32::WHITE)
+                    .inner_margin(egui::Margin::symmetric(20, 12)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(34., 34.), egui::Sense::hover());
+                    ui.painter().rect_filled(rect, 8, visual::BLUE);
+                    visual::icon(ui.painter(), rect.shrink(7.), Icon::Disk, Color32::WHITE);
+                    ui.label(RichText::new("RustGotek").size(22.).strong());
+                    ui.add_space(12.);
+                    ui.label(RichText::new("DISK MANAGER").size(11.).color(visual::MUTED));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        visual::badge(
+                            ui,
+                            if self.busy { "WORKING" } else { "READY" },
+                            visual::GREEN,
+                            Color32::from_rgb(232, 245, 239),
                         );
+                        if self.busy {
+                            ui.spinner();
+                        }
                     });
-            }
-        });
+                });
+            });
+        egui::TopBottomPanel::bottom("status")
+            .frame(
+                egui::Frame::new()
+                    .fill(Color32::WHITE)
+                    .inner_margin(egui::Margin::symmetric(16, 8)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    let (r, _) = ui.allocate_exact_size(egui::vec2(16., 16.), egui::Sense::hover());
+                    visual::icon(
+                        ui.painter(),
+                        r,
+                        if self.error { Icon::Close } else { Icon::Check },
+                        if self.error {
+                            visual::RED
+                        } else {
+                            visual::GREEN
+                        },
+                    );
+                    ui.add(
+                        egui::Label::new(RichText::new(&self.status).size(12.).color(
+                            if self.error {
+                                visual::RED
+                            } else {
+                                visual::MUTED
+                            },
+                        ))
+                        .truncate(),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if visual::small_button(ui, Icon::Log, "Activity").clicked() {
+                            self.show_log = !self.show_log;
+                        }
+                        if self.show_log && ui.small_button("Copy log").clicked() {
+                            ctx.copy_text(self.log.clone());
+                        }
+                    });
+                });
+                if self.show_log {
+                    egui::ScrollArea::vertical()
+                        .max_height(115.)
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::TextEdit::multiline(&mut self.log)
+                                    .font(egui::TextStyle::Monospace)
+                                    .desired_width(f32::INFINITY),
+                            );
+                        });
+                }
+            });
         egui::SidePanel::left("navigation")
             .resizable(false)
-            .exact_width(190.0)
+            .exact_width(86.)
+            .frame(
+                egui::Frame::new()
+                    .fill(visual::NAVY)
+                    .inner_margin(egui::Margin::symmetric(10, 18)),
+            )
             .show(ctx, |ui| {
-                ui.add_space(18.0);
-                ui.label(RichText::new("YOUR DISKS").small().weak());
-                ui.add_space(8.0);
                 ui.add_enabled_ui(!self.busy && self.form.is_none(), |ui| {
-                    for (mode, label) in [
-                        (Workspace::Images, "Image library"),
-                        (Workspace::Banks, "Gotek USB banks"),
-                    ] {
-                        if ui
-                            .selectable_label(
-                                self.workspace == mode,
-                                RichText::new(label).size(17.0),
-                            )
-                            .clicked()
-                            && self.workspace != mode
-                        {
-                            self.workspace = mode;
-                            self.sort = if mode == Workspace::Banks {
-                                Sort::Bank
-                            } else {
-                                Sort::Name
-                            };
-                            self.descending = false;
-                            self.clear();
-                            self.filter.clear();
-                            self.show_all = false;
-                            if mode == Workspace::Images {
-                                self.refresh(ctx);
-                            }
-                        }
+                    if visual::nav_button(
+                        ui,
+                        Icon::Library,
+                        "Library",
+                        self.workspace == Workspace::Images,
+                    )
+                    .on_hover_text("Image library")
+                    .clicked()
+                    {
+                        self.switch_workspace(Workspace::Images, ctx);
                     }
-                    ui.add_space(24.0);
-                    ui.label(RichText::new("UTILITIES").small().weak());
-                    if ui.button("Backups & restore").clicked() {
-                        self.tool_page = if self.workspace == Workspace::Banks {
-                            Page::Banks
-                        } else {
-                            Page::Backups
-                        };
-                        self.tools = true;
+                    if visual::nav_button(
+                        ui,
+                        Icon::Drive,
+                        "USB banks",
+                        self.workspace == Workspace::Banks,
+                    )
+                    .on_hover_text("Gotek USB banks")
+                    .clicked()
+                    {
+                        self.switch_workspace(Workspace::Banks, ctx);
                     }
-                    if ui.button("All tools").clicked() {
-                        self.tools = true;
-                    }
-                    ui.separator();
-                    let help = if self.workspace == Workspace::Banks {
-                        "Bank numbers start at 000. Scanning reads headers only; use Check disk for allocation checks."
-                    } else {
-                        "Open a folder of disk images or mounted USB files. Double-click a disk to browse its files."
-                    };
-                    ui.label(RichText::new(help).small().weak());
+                });
+                ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
+                    ui.label(
+                        RichText::new(concat!("v", env!("CARGO_PKG_VERSION")))
+                            .size(11.)
+                            .color(Color32::from_rgb(145, 164, 190)),
+                    );
                 });
             });
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.add_enabled_ui(!self.busy && self.form.is_none(), |ui| {
-                self.workspace_ui(ui, ctx)
+        egui::TopBottomPanel::top("action-toolbar")
+            .frame(
+                egui::Frame::new()
+                    .fill(Color32::WHITE)
+                    .inner_margin(egui::Margin::symmetric(18, 10)),
+            )
+            .show(ctx, |ui| {
+                ui.add_enabled_ui(!self.busy && self.form.is_none(), |ui| {
+                    self.actions_ui(ui, ctx)
+                });
             });
-        });
-        self.tools_window(ctx);
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::new()
+                    .fill(visual::PAPER)
+                    .inner_margin(egui::Margin::symmetric(24, 20)),
+            )
+            .show(ctx, |ui| {
+                ui.add_enabled_ui(!self.busy && self.form.is_none(), |ui| {
+                    self.workspace_ui(ui, ctx)
+                });
+            });
         self.preview_window(ctx);
         self.form_window(ctx);
+    }
+    fn switch_workspace(&mut self, mode: Workspace, ctx: &egui::Context) {
+        if self.workspace == mode {
+            return;
+        }
+        self.workspace = mode;
+        self.sort = if mode == Workspace::Banks {
+            Sort::Bank
+        } else {
+            Sort::Name
+        };
+        self.descending = false;
+        self.clear();
+        self.filter.clear();
+        self.show_all = false;
+        if mode == Workspace::Images {
+            self.refresh(ctx);
+        }
+    }
+    fn create_disk_form(&mut self) {
+        self.open_form("create-fat12");
+        if let (Some(l), Some(f)) = (&self.listing, &mut self.form)
+            && !l.read_only
+        {
+            f.values[0] = new_image_path(&l.directory, "New disk")
+                .to_string_lossy()
+                .into_owned();
+        }
+    }
+    fn choose_source(&mut self, ctx: &egui::Context) {
+        if self.workspace == Workspace::Images {
+            self.worker(ctx, "Choose an image folder…", || {
+                Ok(Event::Folder(rfd::FileDialog::new().pick_folder()))
+            });
+        } else {
+            self.worker(ctx, "Choose a whole-device image…", || {
+                Ok(Event::Source(rfd::FileDialog::new().pick_file()))
+            });
+        }
+    }
+    fn shortcuts(&mut self, ctx: &egui::Context) {
+        if self.busy
+            || self.form.is_some()
+            || self.preview.is_some()
+            || egui::Popup::is_any_open(ctx)
+        {
+            return;
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::N)) {
+            self.create_disk_form();
+        } else if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::O)) {
+            self.choose_source(ctx);
+        } else if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F5)) {
+            if self.workspace == Workspace::Banks && !self.source.trim().is_empty() {
+                self.scan(ctx);
+            } else {
+                self.refresh(ctx);
+            }
+        } else if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::F)) {
+            ctx.memory_mut(|m| m.request_focus(egui::Id::new("disk-search")));
+        }
     }
 }
 
 impl App {
     fn workspace_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        ui.add_space(8.0);
-        ui.heading(if self.workspace == Workspace::Images {
-            "Image library"
-        } else {
-            "Gotek USB banks"
+        let banks = self.workspace == Workspace::Banks;
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.heading(if banks {
+                    "Gotek USB banks"
+                } else {
+                    "Image library"
+                });
+                ui.label(
+                    RichText::new(if banks {
+                        "Every floppy. One workspace."
+                    } else {
+                        "A home for your floppy collection."
+                    })
+                    .color(visual::MUTED),
+                );
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if banks {
+                    visual::badge(
+                        ui,
+                        if self.profile == "gotek1440" {
+                            "1.44 MB / BANK"
+                        } else {
+                            "720 KB / BANK"
+                        },
+                        visual::BLUE,
+                        visual::PALE,
+                    );
+                } else {
+                    visual::badge(ui, "LOCAL IMAGES", visual::BLUE, visual::PALE);
+                }
+            });
         });
-        ui.label(if self.workspace == Workspace::Images {
-            "Your disk images, ready to browse, edit and export."
-        } else {
-            "Select disks below to browse, export or replace them."
-        });
-        ui.add_space(12.0);
-        self.source_ui(ui, ctx);
-        ui.add_space(12.0);
-        self.actions_ui(ui, ctx);
-        ui.separator();
+        ui.add_space(16.);
+        egui::Frame::new()
+            .fill(Color32::WHITE)
+            .stroke(egui::Stroke::new(1.0f32, visual::BORDER))
+            .corner_radius(10)
+            .inner_margin(14)
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                self.source_ui(ui, ctx);
+            });
+        ui.add_space(16.);
         ui.horizontal_wrapped(|ui| {
+            let (r, _) = ui.allocate_exact_size(egui::vec2(18., 18.), egui::Sense::hover());
+            visual::icon(ui.painter(), r, Icon::Search, visual::MUTED);
             ui.add(
                 egui::TextEdit::singleline(&mut self.filter)
-                    .hint_text("Search names, bank numbers or formats…")
-                    .desired_width(280.0),
+                    .id(egui::Id::new("disk-search"))
+                    .hint_text("Search disks…")
+                    .desired_width(210.),
             );
             ui.checkbox(
                 &mut self.show_all,
-                if self.workspace == Workspace::Banks {
-                    "Include unrecognized banks"
+                if banks {
+                    "Include unrecognized"
                 } else {
                     "Show all files"
                 },
             );
-            ui.label(format!("{} selected", self.selected.len()));
-            if ui.button("Clear selection").clicked() {
-                self.selected.clear();
-            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if !self.selected.is_empty() {
+                    if visual::small_button(ui, Icon::Close, "")
+                        .on_hover_text("Clear selection")
+                        .clicked()
+                    {
+                        self.selected.clear();
+                    }
+                    visual::badge(
+                        ui,
+                        &format!("{} selected", self.selected.len()),
+                        visual::BLUE,
+                        visual::PALE,
+                    );
+                }
+                ui.label(
+                    RichText::new(format!("{} shown", self.visible().len()))
+                        .size(12.)
+                        .color(visual::MUTED),
+                );
+            });
         });
-        self.table_ui(ui, ctx);
+        ui.add_space(10.);
+        egui::Frame::new()
+            .fill(Color32::WHITE)
+            .stroke(egui::Stroke::new(1.0f32, visual::BORDER))
+            .corner_radius(10)
+            .inner_margin(12)
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                self.table_ui(ui, ctx);
+            });
     }
     fn source_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let banks = self.workspace == Workspace::Banks;
+        ui.horizontal(|ui| {
+            let (r, _) = ui.allocate_exact_size(egui::vec2(18., 18.), egui::Sense::hover());
+            visual::icon(
+                ui.painter(),
+                r,
+                if banks { Icon::Drive } else { Icon::Folder },
+                visual::BLUE,
+            );
+            ui.label(
+                RichText::new(if banks {
+                    "DEVICE OR BACKUP IMAGE"
+                } else {
+                    "IMAGE FOLDER"
+                })
+                .size(11.)
+                .strong()
+                .color(visual::MUTED),
+            );
+            if let Some(catalog) = &self.bank_catalog {
+                ui.label(
+                    RichText::new(format!("{} capacity", format_size(catalog.size)))
+                        .size(12.)
+                        .color(visual::MUTED),
+                );
+            }
+        });
         ui.horizontal_wrapped(|ui| {
-            if self.workspace == Workspace::Images {
-                ui.label("Folder");
-                if ui
-                    .add(
-                        egui::TextEdit::singleline(&mut self.root)
-                            .desired_width((ui.available_width() * 0.55).clamp(160.0, 600.0)),
-                    )
-                    .changed()
-                {
-                    self.clear();
-                }
-                if ui.button("Choose folder…").clicked() {
-                    self.worker(ctx, "Choose a folder…", || {
-                        Ok(Event::Folder(rfd::FileDialog::new().pick_folder()))
-                    });
-                }
-                if ui.button("Open / Refresh").clicked() {
-                    self.refresh(ctx);
-                }
+            let width = (ui.available_width() - if banks { 380. } else { 220. }).max(130.);
+            let response = if banks {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.source)
+                        .hint_text("/dev/sda or a whole-device image")
+                        .desired_width(width),
+                )
             } else {
-                ui.label("Source");
-                if ui
-                    .add(
-                        egui::TextEdit::singleline(&mut self.source)
-                            .hint_text("/dev/sda or a whole-device image")
-                            .desired_width((ui.available_width() - 420.0).max(160.0)),
-                    )
-                    .changed()
-                {
-                    self.clear();
-                }
-                if ui.button("Browse…").clicked() {
-                    self.worker(ctx, "Choose a whole-device image…", || {
-                        Ok(Event::Source(rfd::FileDialog::new().pick_file()))
-                    });
-                }
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.root)
+                        .hint_text("Choose a folder of images")
+                        .desired_width(width),
+                )
+            };
+            if response.changed() {
+                self.clear();
+            }
+            let enter = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if visual::small_button(ui, Icon::Folder, "Browse")
+                .on_hover_text("Choose a source · Ctrl/Cmd+O")
+                .clicked()
+            {
+                self.choose_source(ctx);
+            }
+            if banks {
                 let old = self.profile.clone();
                 egui::ComboBox::from_id_salt("bank-profile")
+                    .width(120.)
                     .selected_text(if self.profile == "gotek1440" {
                         "1.44 MB banks"
                     } else {
@@ -1378,14 +1513,28 @@ impl App {
                 if old != self.profile {
                     self.clear();
                 }
-                if ui
-                    .add_enabled(
-                        !self.source.trim().is_empty(),
-                        egui::Button::new("Scan banks"),
+            }
+            let valid = if banks {
+                !self.source.trim().is_empty()
+            } else {
+                !self.root.trim().is_empty()
+            };
+            let clicked = ui
+                .add_enabled_ui(valid, |ui| {
+                    visual::small_button(
+                        ui,
+                        Icon::Refresh,
+                        if banks { "Scan banks" } else { "Refresh" },
                     )
-                    .clicked()
-                {
+                    .on_hover_text("Read the current source · F5")
+                })
+                .inner
+                .clicked();
+            if valid && (clicked || enter) {
+                if banks {
                     self.scan(ctx);
+                } else {
+                    self.refresh(ctx);
                 }
             }
         });
@@ -1393,21 +1542,30 @@ impl App {
             let root = listing.root.clone();
             let dir = listing.directory.clone();
             let readonly = listing.read_only;
-            ui.horizontal_wrapped(|ui| {
-                if ui
-                    .add_enabled(root != dir, egui::Button::new("< Up"))
-                    .clicked()
-                {
-                    let parent = dir.parent().unwrap_or(&root).to_owned();
-                    self.worker(ctx, "Reading folder…", move || {
-                        read_listing(&root, &parent).map(Event::Listed)
-                    });
-                }
-                ui.label(dir.display().to_string());
-                if readonly {
-                    ui.colored_label(Color32::LIGHT_YELLOW, "Read-only media");
-                }
-            });
+            if root != dir || readonly {
+                ui.horizontal_wrapped(|ui| {
+                    if root != dir && visual::small_button(ui, Icon::Up, "Parent folder").clicked()
+                    {
+                        let parent = dir.parent().unwrap_or(&root).to_owned();
+                        self.worker(ctx, "Reading folder…", move || {
+                            read_listing(&root, &parent).map(Event::Listed)
+                        });
+                    }
+                    ui.label(
+                        RichText::new(dir.display().to_string())
+                            .size(12.)
+                            .color(visual::MUTED),
+                    );
+                    if readonly {
+                        visual::badge(
+                            ui,
+                            "READ ONLY",
+                            visual::AMBER,
+                            Color32::from_rgb(255, 245, 223),
+                        );
+                    }
+                });
+            }
         }
     }
     fn actions_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -1415,87 +1573,319 @@ impl App {
         let single = selected.len() == 1 && !selected[0].directory;
         let can_export = !selected.is_empty() && selected.iter().all(|r| !r.directory);
         let readonly = self.listing.as_ref().is_some_and(|l| l.read_only);
+        let banks = self.workspace == Workspace::Banks;
+        ui.spacing_mut().item_spacing.x = 4.;
         ui.horizontal_wrapped(|ui| {
-            if ui.button(RichText::new("+ Create disk").strong()).clicked() {
-                self.open_form("create-fat12");
-                if let (Some(l), Some(f)) = (&self.listing, &mut self.form)
-                    && !readonly
-                {
-                    f.values[0] = new_image_path(&l.directory, "New disk")
-                        .to_string_lossy()
-                        .into_owned();
-                }
-            }
-            if self.workspace == Workspace::Images
-                && ui
-                    .add_enabled(
-                        self.listing.is_some() && !readonly,
-                        egui::Button::new("Import images…"),
-                    )
-                    .clicked()
+            if visual::toolbar_button(
+                ui,
+                Icon::Add,
+                "New disk",
+                "Create a formatted floppy image · Ctrl/Cmd+N",
+                true,
+                true,
+            )
+            .clicked()
             {
-                self.import_images(ctx);
+                self.create_disk_form();
             }
-            if ui
-                .add_enabled(single, egui::Button::new("Open contents"))
+            if banks {
+                if visual::toolbar_button(
+                    ui,
+                    Icon::Library,
+                    "New layout",
+                    "Create a whole-device image with formatted floppy banks",
+                    true,
+                    false,
+                )
                 .clicked()
-            {
-                self.open_disk(ctx, selected[0].clone());
-            }
-            let export_label = if selected.len() > 1 {
-                format!("Export {} disks…", selected.len())
-            } else {
-                "Export…".into()
-            };
-            if ui
-                .add_enabled(can_export, egui::Button::new(export_label))
-                .clicked()
-            {
-                self.export_selected(ctx);
-            }
-            if self.workspace == Workspace::Banks {
-                if ui
-                    .add_enabled(single, egui::Button::new("Replace disk…"))
-                    .clicked()
                 {
-                    self.replace_bank_form(&selected[0]);
-                }
-                if ui.button("New bank layout…").clicked() {
                     self.open_form("bank-create");
                     if let (Some(c), Some(f)) = (&self.bank_catalog, &mut self.form) {
                         f.values[3] = c.size.to_string();
                     }
                 }
-            } else if ui
-                .add_enabled(single && !readonly, egui::Button::new("Move to trash…"))
-                .clicked()
+            } else if visual::toolbar_button(
+                ui,
+                Icon::Import,
+                "Import",
+                "Add disk images to the open folder",
+                self.listing.is_some() && !readonly,
+                false,
+            )
+            .clicked()
             {
-                let r = &selected[0];
-                self.form = Some(Form {
-                    title: format!("Move {} to trash", r.name),
-                    description:
-                        "The file is moved into the media's recoverable .rustgotek-trash folder."
-                            .into(),
-                    command: "remove".into(),
-                    labels: vec!["Selected file".into()],
-                    kinds: vec![Kind::Text],
-                    values: vec![r.key.clone()],
-                    media: true,
-                    writes_media: true,
-                    confirm: true,
-                    review: false,
-                    keepalive: None,
+                self.import_images(ctx);
+            }
+            toolbar_divider(ui);
+            if visual::toolbar_button(
+                ui,
+                Icon::Folder,
+                "Open",
+                "Browse a disk or folder; inspect an HFE image",
+                selected.len() == 1,
+                false,
+            )
+            .clicked()
+            {
+                self.open_disk(ctx, selected[0].clone());
+            }
+            if visual::toolbar_button(
+                ui,
+                Icon::Export,
+                "Export",
+                "Export selected disks to new files",
+                can_export,
+                false,
+            )
+            .clicked()
+            {
+                self.export_selected(ctx);
+            }
+            if banks {
+                let replace = visual::toolbar_menu(
+                    ui,
+                    Icon::Replace,
+                    "Replace",
+                    "Replace the selected bank or edit a backup copy",
+                    single,
+                );
+                egui::Popup::menu(&replace).show(|ui| {
+                    if menu_item(ui, "Replace bank with recovery…", true) {
+                        self.replace_bank_form(&selected[0]);
+                    }
+                    ui.separator();
+                    if menu_item(ui, "Use an expected-original image…", true) {
+                        self.open_form("bank-write");
+                    }
+                    if menu_item(ui, "Replace in a new backup copy…", self.source_is_file()) {
+                        self.open_form("bank-replace");
+                    }
+                });
+            } else if visual::toolbar_button(
+                ui,
+                Icon::Trash,
+                "Trash",
+                "Move the selected image into recoverable trash",
+                single && !readonly,
+                false,
+            )
+            .clicked()
+            {
+                self.trash_form(&selected[0]);
+            }
+            toolbar_divider(ui);
+            let check = visual::toolbar_menu(
+                ui,
+                Icon::Check,
+                "Check",
+                "Check a disk or inspect its format and geometry",
+                selected.is_empty() || single,
+            );
+            egui::Popup::menu(&check).show(|ui| {
+                let hfe = selected.first().is_some_and(DiskRow::is_hfe);
+                if menu_item(ui, "Check FAT12 filesystem", !hfe) {
+                    self.disk_command(ctx, "image-check");
+                }
+                if menu_item(ui, "Inspect FAT12 geometry", !hfe) {
+                    self.disk_command(ctx, "inspect-fat12");
+                }
+                if menu_item(ui, "Inspect HFE tracks", selected.is_empty() || hfe) {
+                    self.disk_command(ctx, "inspect-hfe");
+                }
+            });
+            let backup = visual::toolbar_menu(
+                ui,
+                Icon::Backup,
+                "Backup",
+                "Create, verify or restore a backup of the current workspace",
+                true,
+            );
+            egui::Popup::menu(&backup).show(|ui| self.backup_menu(ui));
+            let convert = visual::toolbar_menu(
+                ui,
+                Icon::Convert,
+                "Convert",
+                "Convert the selected disk, or choose an image",
+                selected.is_empty() || single,
+            );
+            egui::Popup::menu(&convert).show(|ui| {
+                let hfe = selected.first().is_some_and(DiskRow::is_hfe);
+                if menu_item(ui, "Raw image to HFE…", !hfe) {
+                    self.disk_command(ctx, "convert-hfe");
+                }
+                if menu_item(ui, "HFE to raw image…", selected.is_empty() || hfe) {
+                    self.disk_command(ctx, "convert-raw");
+                }
+            });
+            let device = visual::toolbar_menu(
+                ui,
+                Icon::Tools,
+                "Device",
+                "Source reports, FlashFloppy slots, configuration and firmware",
+                true,
+            );
+            egui::Popup::menu(&device).show(|ui| self.device_menu(ui, ctx));
+        });
+    }
+    fn source_is_file(&self) -> bool {
+        self.workspace == Workspace::Banks && Path::new(&self.source).is_file()
+    }
+    fn backup_menu(&mut self, ui: &mut egui::Ui) {
+        let banks = self.workspace == Workspace::Banks;
+        let available = if banks {
+            !self.source.trim().is_empty()
+        } else {
+            self.listing.is_some()
+        };
+        ui.label(
+            RichText::new(if banks { "WHOLE DEVICE" } else { "OPEN FOLDER" })
+                .small()
+                .color(visual::MUTED),
+        );
+        if menu_item(ui, "Create backup…", available) {
+            self.open_form(if banks { "bank-backup" } else { "backup" });
+        }
+        if menu_item(ui, "Verify against a backup…", available) {
+            self.open_form(if banks { "bank-verify" } else { "verify" });
+        }
+        ui.separator();
+        if menu_item(
+            ui,
+            if banks {
+                "Restore whole-device image…"
+            } else {
+                "Restore to a new folder…"
+            },
+            true,
+        ) {
+            self.open_form(if banks { "device-restore" } else { "restore" });
+        }
+    }
+    fn device_menu(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if self.workspace == Workspace::Banks {
+            if menu_item(ui, "Refresh bank table", !self.source.trim().is_empty()) {
+                self.scan(ctx);
+            }
+            if menu_item(ui, "Bank header report", !self.source.trim().is_empty()) {
+                self.open_form("bank-list");
+            }
+            ui.separator();
+            ui.label(
+                RichText::new("FlashFloppy file tools are in Image library.")
+                    .small()
+                    .color(visual::MUTED),
+            );
+            if menu_item(ui, "Open mounted media folder…", true) {
+                self.worker(ctx, "Choose a mounted media folder…", || {
+                    Ok(Event::Folder(rfd::FileDialog::new().pick_folder()))
                 });
             }
-            if ui.button("More tools…").clicked() {
-                self.tool_page = if self.workspace == Workspace::Banks {
-                    Page::Banks
-                } else {
-                    Page::Images
-                };
-                self.tools = true;
+        } else {
+            if menu_item(ui, "Media report", self.listing.is_some()) {
+                self.open_form("media-info");
             }
+            ui.separator();
+            ui.menu_button("Indexed slots", |ui| self.category_menu(ui, Page::Slots));
+            ui.menu_button("FlashFloppy settings", |ui| {
+                self.category_menu(ui, Page::Config)
+            });
+        }
+        ui.separator();
+        ui.menu_button("Firmware", |ui| self.category_menu(ui, Page::Firmware));
+    }
+    fn category_menu(&mut self, ui: &mut egui::Ui, page: Page) {
+        for op in OPS.iter().filter(|o| o.page == page) {
+            let available = (!op.media
+                || self.workspace == Workspace::Images && self.listing.is_some())
+                && (!op.writes_media || !self.listing.as_ref().is_some_and(|l| l.read_only));
+            if menu_item(ui, op.title, available) {
+                self.open_form(op.command);
+            }
+        }
+        if self.workspace != Workspace::Images || self.listing.is_none() {
+            ui.label(
+                RichText::new("Open a mounted folder in Image library for media actions.")
+                    .small()
+                    .color(visual::MUTED),
+            );
+        }
+    }
+    fn trash_form(&mut self, row: &DiskRow) {
+        self.form = Some(Form {
+            title: format!("Move {} to trash", row.name),
+            description: "Move this image into the media's recoverable .rustgotek-trash folder."
+                .into(),
+            command: "remove".into(),
+            labels: vec!["Selected file".into()],
+            kinds: vec![Kind::Text],
+            values: vec![row.key.clone()],
+            media: true,
+            writes_media: true,
+            confirm: true,
+            review: false,
+            keepalive: None,
         });
+    }
+    fn disk_command(&mut self, ctx: &egui::Context, command: &'static str) {
+        let selected = self.selection();
+        let [row] = selected.as_slice() else {
+            self.open_form(command);
+            return;
+        };
+        if row.directory {
+            return;
+        }
+        let row = row.clone();
+        let profile = self.profile.clone();
+        self.worker(ctx, "Preparing selected disk…", move || {
+            let (image, temp) = disk_snapshot(&row, &profile)?;
+            if matches!(command, "image-check" | "inspect-fat12" | "inspect-hfe") {
+                return backend(vec![command.into(), image.to_string_lossy().into_owned()])
+                    .map(Event::Done);
+            }
+            let op = OPS
+                .iter()
+                .find(|o| o.command == command)
+                .ok_or("Unknown disk action")?;
+            let mut form = Form::operation(op);
+            form.values[0] = image.to_string_lossy().into_owned();
+            form.keepalive = temp;
+            if command == "convert-hfe" {
+                form.values[2] = match row.size / 1024 {
+                    360 => "pc360",
+                    720 => "pc720",
+                    1200 => "pc1200",
+                    _ => "pc1440",
+                }
+                .into();
+            }
+            Ok(Event::Prepared(form))
+        });
+    }
+    fn apply_disk_action(&mut self, ctx: &egui::Context, action: DiskAction) {
+        let selected = self.selection();
+        match action {
+            DiskAction::Export => self.export_selected(ctx),
+            DiskAction::Open => {
+                if let [row] = selected.as_slice() {
+                    self.open_disk(ctx, row.clone());
+                }
+            }
+            DiskAction::Replace => {
+                if let [row] = selected.as_slice() {
+                    self.replace_bank_form(row);
+                }
+            }
+            DiskAction::Trash => {
+                if let [row] = selected.as_slice() {
+                    self.trash_form(row);
+                }
+            }
+            DiskAction::Command(cmd) if cmd.starts_with("bank-") || cmd == "slot" => {
+                self.open_form(cmd)
+            }
+            DiskAction::Command(cmd) => self.disk_command(ctx, cmd),
+        }
     }
     fn sort_header(&mut self, ui: &mut egui::Ui, label: &str, sort: Sort) {
         let label = if self.sort == sort {
@@ -1515,8 +1905,17 @@ impl App {
     fn table_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let visible = self.visible();
         if self.rows.is_empty() {
-            ui.add_space(55.0);
+            ui.add_space(24.0);
             ui.vertical_centered(|ui| {
+                visual::empty_art(
+                    ui,
+                    if self.workspace == Workspace::Banks {
+                        Icon::Drive
+                    } else {
+                        Icon::Disk
+                    },
+                );
+                ui.add_space(12.0);
                 ui.heading(if self.workspace == Workspace::Images {
                     "Bring your disks into one place"
                 } else {
@@ -1538,12 +1937,14 @@ impl App {
             return;
         }
         let mut open = None;
-        let mut export = None;
-        let mut replace = None;
+        let mut action = None;
+        let readonly = self.listing.as_ref().is_some_and(|l| l.read_only);
+        let backup_file = self.source_is_file();
         let banks = self.workspace == Workspace::Banks;
-        let height = (ui.available_height() - 45.0).max(100.0);
+        let height = (ui.available_height() - 20.0).max(100.0);
         let mut table = TableBuilder::new(ui)
             .id_salt(("disk-table", banks))
+            .sense(egui::Sense::click())
             .striped(true)
             .resizable(true)
             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
@@ -1557,7 +1958,7 @@ impl App {
             .column(Column::remainder().at_least(160.0))
             .column(Column::initial(170.0))
             .column(Column::initial(100.0))
-            .header(32.0, |mut header| {
+            .header(36.0, |mut header| {
                 header.col(|ui| {
                     let mut all = visible
                         .iter()
@@ -1588,12 +1989,15 @@ impl App {
                 }
             })
             .body(|body| {
-                body.rows(34.0, visible.len(), |mut tr| {
+                body.rows(42.0, visible.len(), |mut tr| {
                     let row = &self.rows[visible[tr.index()]];
                     let mut chosen = self.selected.contains(&row.key);
+                    let mut widget_response: Option<egui::Response> = None;
                     tr.set_selected(chosen);
                     tr.col(|ui| {
-                        if ui.checkbox(&mut chosen, "").changed() {
+                        let response = ui.checkbox(&mut chosen, "");
+                        widget_response = Some(response.clone());
+                        if response.changed() {
                             if chosen {
                                 self.selected.insert(row.key.clone());
                             } else {
@@ -1603,18 +2007,39 @@ impl App {
                     });
                     if banks {
                         tr.col(|ui| {
-                            ui.monospace(row.bank.map(|n| format!("{n:03}")).unwrap_or_default());
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(
+                                        row.bank.map(|n| format!("{n:03}")).unwrap_or_default(),
+                                    )
+                                    .monospace(),
+                                )
+                                .selectable(false),
+                            );
                         });
                     }
                     tr.col(|ui| {
-                        let response = ui.selectable_label(
-                            chosen,
-                            if row.directory {
-                                format!("▸ {}", row.name)
-                            } else {
-                                row.name.clone()
-                            },
-                        );
+                        let response = ui
+                            .horizontal(|ui| {
+                                let (r, _) = ui.allocate_exact_size(
+                                    egui::vec2(20., 20.),
+                                    egui::Sense::hover(),
+                                );
+                                visual::icon(
+                                    ui.painter(),
+                                    r,
+                                    if row.directory {
+                                        Icon::Folder
+                                    } else {
+                                        Icon::Disk
+                                    },
+                                    visual::BLUE,
+                                );
+                                ui.selectable_label(chosen, &row.name)
+                            })
+                            .inner;
+                        widget_response =
+                            Some(widget_response.take().unwrap().union(response.clone()));
                         if response.clicked() {
                             if !ui.input(|i| i.modifiers.command) {
                                 self.selected.clear();
@@ -1624,85 +2049,52 @@ impl App {
                         if response.double_clicked() {
                             open = Some(row.clone());
                         }
-                        response.context_menu(|ui| {
-                            if ui.button("Open contents").clicked() {
-                                open = Some(row.clone());
-                                ui.close();
-                            }
-                            if !row.directory && ui.button("Export…").clicked() {
-                                export = Some(row.clone());
-                                ui.close();
-                            }
-                            if row.bank.is_some() && ui.button("Replace disk…").clicked() {
-                                replace = Some(row.clone());
-                                ui.close();
-                            }
-                        });
                     });
                     tr.col(|ui| {
-                        ui.label(RichText::new(&row.kind).color(if row.recognized {
-                            Color32::from_rgb(137, 205, 187)
-                        } else {
-                            Color32::GRAY
-                        }));
+                        ui.add(
+                            egui::Label::new(RichText::new(&row.kind).color(if row.recognized {
+                                visual::GREEN
+                            } else {
+                                Color32::GRAY
+                            }))
+                            .selectable(false),
+                        );
                     });
                     tr.col(|ui| {
-                        ui.label(if row.directory {
-                            String::new()
-                        } else {
-                            format_size(row.size)
-                        });
+                        ui.add(
+                            egui::Label::new(if row.directory {
+                                String::new()
+                            } else {
+                                format_size(row.size)
+                            })
+                            .selectable(false),
+                        );
+                    });
+                    let response = tr.response().union(widget_response.unwrap());
+                    if response.secondary_clicked() {
+                        select_context_row(&mut self.selected, row);
+                    }
+                    if response.double_clicked() {
+                        open = Some(row.clone());
+                    }
+                    response.context_menu(|ui| {
+                        let selected: Vec<_> = self
+                            .rows
+                            .iter()
+                            .filter(|r| self.selected.contains(&r.key))
+                            .cloned()
+                            .collect();
+                        if let Some(chosen) = disk_menu(ui, &selected, readonly, backup_file) {
+                            action = Some(chosen);
+                        }
                     });
                 })
             });
         if let Some(row) = open {
             self.open_disk(ctx, row);
         }
-        if let Some(row) = export {
-            self.selected.clear();
-            self.selected.insert(row.key);
-            self.export_selected(ctx);
-        }
-        if let Some(row) = replace {
-            self.replace_bank_form(&row);
-        }
-    }
-    fn tools_window(&mut self, ctx: &egui::Context) {
-        if !self.tools {
-            return;
-        }
-        let mut open = true;
-        let mut command = None;
-        egui::Window::new("More tools")
-            .open(&mut open)
-            .default_width(680.0)
-            .show(ctx, |ui| {
-                ui.add_enabled_ui(!self.busy && self.form.is_none(), |ui| {
-                    ui.horizontal_wrapped(|ui| {
-                        for page in Page::ALL {
-                            ui.selectable_value(&mut self.tool_page, page, page.title());
-                        }
-                    });
-                    ui.label(self.tool_page.description());
-                    ui.separator();
-                    egui::ScrollArea::vertical()
-                        .max_height(440.0)
-                        .show(ui, |ui| {
-                            for op in OPS.iter().filter(|o| o.page == self.tool_page) {
-                                ui.horizontal(|ui| {
-                                    if ui.button(op.title).clicked() {
-                                        command = Some(op.command);
-                                    }
-                                    ui.label(RichText::new(op.description).small().weak());
-                                });
-                                ui.separator();
-                            }
-                        });
-                });
-            });
-        self.tools = open;
-        if let Some(command) = command {
-            self.open_form(command);
+        if let Some(action) = action {
+            self.apply_disk_action(ctx, action);
         }
     }
     fn form_window(&mut self, ctx: &egui::Context) {
@@ -1725,7 +2117,7 @@ impl App {
                     }
                     ui.separator();
                     if form.review {
-                        ui.colored_label(Color32::LIGHT_YELLOW, "Review before changing data");
+                        ui.colored_label(visual::AMBER, "Review before changing data");
                         for (label, value) in form.labels.iter().zip(&form.values) {
                             ui.label(RichText::new(label).strong());
                             ui.label(value);
@@ -1736,7 +2128,14 @@ impl App {
                                 form.review = false;
                             }
                             if ui
-                                .button(RichText::new("Confirm and run").strong())
+                                .add(
+                                    egui::Button::new(
+                                        RichText::new("Confirm and run")
+                                            .strong()
+                                            .color(Color32::WHITE),
+                                    )
+                                    .fill(visual::BLUE),
+                                )
                                 .clicked()
                             {
                                 execute = true;
@@ -1796,7 +2195,7 @@ impl App {
                         let readonly =
                             form.writes_media && self.listing.as_ref().is_some_and(|l| l.read_only);
                         if readonly {
-                            ui.colored_label(Color32::LIGHT_YELLOW, "This media is read-only.");
+                            ui.colored_label(visual::AMBER, "This media is read-only.");
                         }
                         let valid = form.args(&self.root).is_ok() && !readonly;
                         if ui
@@ -1867,19 +2266,19 @@ impl App {
                         ui.label(RichText::new("Bank snapshot: save edits to an image, then use Replace disk to write it back.").small().weak());
                     }
                     ui.horizontal_wrapped(|ui| {
-                        if ui.add_enabled(preview.directory != "/", egui::Button::new("< Up")).clicked() {
+                        if ui.add_enabled_ui(preview.directory != "/", |ui| visual::small_button(ui, Icon::Up, "Up")).inner.clicked() {
                             directory = Some(parent_directory(&preview.directory));
                         }
                         ui.strong(&preview.directory);
-                        if ui.button("Check disk").clicked() { action = Some("image-check"); }
-                        if ui.button("Add file…").clicked() { action = Some("image-import"); }
-                        if ui.button("New folder…").clicked() { action = Some("image-mkdir"); }
+                        if visual::small_button(ui, Icon::Check, "Check disk").clicked() { action = Some("image-check"); }
+                        if visual::small_button(ui, Icon::Import, "Add file").clicked() { action = Some("image-import"); }
+                        if visual::small_button(ui, Icon::Folder, "New folder").clicked() { action = Some("image-mkdir"); }
                     });
                     ui.horizontal_wrapped(|ui| {
                         let selected = preview.selected.as_ref().and_then(|s| preview.entries.iter().find(|e| &e.name == s));
-                        if ui.add_enabled(selected.is_some_and(|e| !e.directory), egui::Button::new("Export file…")).clicked() { extract = true; }
-                        if ui.add_enabled(selected.is_some(), egui::Button::new("Rename…")).clicked() { action = Some("image-rename"); }
-                        if ui.add_enabled(selected.is_some(), egui::Button::new("Remove from copy…")).clicked() { action = Some("image-remove"); }
+                        if ui.add_enabled_ui(selected.is_some_and(|e| !e.directory), |ui| visual::small_button(ui, Icon::Export, "Export file")).inner.clicked() { extract = true; }
+                        if ui.add_enabled_ui(selected.is_some(), |ui| visual::small_button(ui, Icon::Edit, "Rename")).inner.clicked() { action = Some("image-rename"); }
+                        if ui.add_enabled_ui(selected.is_some(), |ui| visual::small_button(ui, Icon::Trash, "Remove from copy")).inner.clicked() { action = Some("image-remove"); }
                     });
                     ui.separator();
                     TableBuilder::new(ui).id_salt("contents-table").striped(true)
@@ -1890,8 +2289,17 @@ impl App {
                             let e = &preview.entries[tr.index()];
                             tr.col(|ui| {
                                 let response = ui.selectable_label(preview.selected.as_ref() == Some(&e.name), &e.name);
-                                if response.clicked() { preview.selected = Some(e.name.clone()); }
+                                if response.clicked() || response.secondary_clicked() { preview.selected = Some(e.name.clone()); }
                                 if response.double_clicked() && e.directory { directory = Some(inner_path(&preview.directory, &e.name)); }
+                                response.context_menu(|ui| {
+                                    if e.directory && menu_item(ui, "Open folder", true) { directory = Some(inner_path(&preview.directory, &e.name)); }
+                                    if !e.directory && menu_item(ui, "Export file…", true) { extract = true; }
+                                    if menu_item(ui, "Rename…", true) { action = Some("image-rename"); }
+                                    if menu_item(ui, "Remove from copy…", true) { action = Some("image-remove"); }
+                                    ui.separator();
+                                    if menu_item(ui, "Add file here…", true) { action = Some("image-import"); }
+                                    if menu_item(ui, "New folder here…", true) { action = Some("image-mkdir"); }
+                                });
                             });
                             tr.col(|ui| { ui.label(if e.directory { "Folder" } else { "File" }); });
                             tr.col(|ui| { ui.label(format_size(e.size)); });
@@ -1975,6 +2383,171 @@ impl App {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiskAction {
+    Open,
+    Export,
+    Replace,
+    Trash,
+    Command(&'static str),
+}
+impl DiskRow {
+    fn is_hfe(&self) -> bool {
+        self.bank.is_none()
+            && self
+                .path
+                .extension()
+                .is_some_and(|s| s.eq_ignore_ascii_case("hfe"))
+    }
+}
+fn menu_item(ui: &mut egui::Ui, label: &str, enabled: bool) -> bool {
+    let clicked = ui
+        .add_enabled(
+            enabled,
+            egui::Button::new(label)
+                .frame(false)
+                .right_text("")
+                .min_size(egui::vec2(220., 28.)),
+        )
+        .clicked();
+    if clicked {
+        ui.close();
+    }
+    clicked
+}
+fn select_context_row(selected: &mut BTreeSet<String>, row: &DiskRow) {
+    if !selected.contains(&row.key) {
+        selected.clear();
+        selected.insert(row.key.clone());
+    }
+}
+fn disk_menu(
+    ui: &mut egui::Ui,
+    rows: &[DiskRow],
+    readonly: bool,
+    backup_file: bool,
+) -> Option<DiskAction> {
+    let mut action = None;
+    if let [row] = rows {
+        ui.label(RichText::new(&row.name).small().color(visual::MUTED));
+        ui.separator();
+        if menu_item(
+            ui,
+            if row.directory {
+                "Open folder"
+            } else if row.is_hfe() {
+                "Inspect HFE tracks"
+            } else {
+                "Open contents"
+            },
+            row.directory || row.recognized,
+        ) {
+            action = Some(DiskAction::Open);
+        }
+    } else {
+        ui.label(
+            RichText::new(format!("{} disks selected", rows.len()))
+                .small()
+                .color(visual::MUTED),
+        );
+    }
+    if menu_item(
+        ui,
+        if rows.len() > 1 {
+            "Export selected disks…"
+        } else {
+            "Export disk…"
+        },
+        !rows.is_empty() && rows.iter().all(|r| !r.directory),
+    ) {
+        action = Some(DiskAction::Export);
+    }
+    if let [row] = rows
+        && !row.directory
+    {
+        if row.recognized {
+            ui.separator();
+            if row.is_hfe() {
+                if menu_item(ui, "Convert to raw image…", true) {
+                    action = Some(DiskAction::Command("convert-raw"));
+                }
+            } else {
+                if menu_item(ui, "Check FAT12 filesystem", true) {
+                    action = Some(DiskAction::Command("image-check"));
+                }
+                if menu_item(ui, "Inspect FAT12 geometry", true) {
+                    action = Some(DiskAction::Command("inspect-fat12"));
+                }
+                if menu_item(ui, "Convert to HFE…", true) {
+                    action = Some(DiskAction::Command("convert-hfe"));
+                }
+                ui.menu_button("Edit disk contents", |ui| {
+                    for (label, cmd) in [
+                        ("Add a file…", "image-import"),
+                        ("Create a folder…", "image-mkdir"),
+                        ("Extract a file…", "image-extract"),
+                        ("Rename an entry…", "image-rename"),
+                        ("Remove an entry from a copy…", "image-remove"),
+                    ] {
+                        if menu_item(ui, label, true) {
+                            action = Some(DiskAction::Command(cmd));
+                        }
+                    }
+                });
+            }
+        }
+        if row.bank.is_some() {
+            ui.separator();
+            if menu_item(ui, "Replace bank with recovery…", true) {
+                action = Some(DiskAction::Replace);
+            }
+            if menu_item(ui, "Replace using expected original…", true) {
+                action = Some(DiskAction::Command("bank-write"));
+            }
+            if menu_item(ui, "Replace in a new backup copy…", backup_file) {
+                action = Some(DiskAction::Command("bank-replace"));
+            }
+        } else {
+            ui.separator();
+            if row.recognized && menu_item(ui, "Assign to indexed slot…", !readonly) {
+                action = Some(DiskAction::Command("slot"));
+            }
+            if menu_item(ui, "Move to trash…", !readonly) {
+                action = Some(DiskAction::Trash);
+            }
+        }
+    }
+    action
+}
+fn disk_snapshot(
+    row: &DiskRow,
+    profile: &str,
+) -> Result<(PathBuf, Option<Arc<tempfile::TempDir>>), String> {
+    if let Some(bank) = row.bank {
+        let temp = Arc::new(tempfile::tempdir().map_err(|e| e.to_string())?);
+        let image = temp.path().join("disk.img");
+        backend(vec![
+            "bank-export".into(),
+            row.path.to_string_lossy().into_owned(),
+            profile.into(),
+            bank.to_string(),
+            image.to_string_lossy().into_owned(),
+        ])?;
+        Ok((image, Some(temp)))
+    } else {
+        Ok((row.path.clone(), None))
+    }
+}
+fn toolbar_divider(ui: &mut egui::Ui) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(14., 64.), egui::Sense::hover());
+    ui.painter().line_segment(
+        [
+            rect.center_top() + egui::vec2(0., 12.),
+            rect.center_bottom() - egui::vec2(0., 12.),
+        ],
+        egui::Stroke::new(1.0f32, visual::BORDER),
+    );
+}
 fn new_image_path(directory: &Path, stem: &str) -> PathBuf {
     let mut candidate = directory.join(format!("{stem}.img"));
     let mut n = 2;
@@ -2321,6 +2894,7 @@ mod tests {
     #[test]
     fn egui_renders_both_workspaces_dialogs_and_long_tables() {
         let ctx = egui::Context::default();
+        visual::apply(&ctx);
         let mut app = app();
         app.rows = (0..1000)
             .map(|n| DiskRow {
@@ -2359,5 +2933,129 @@ mod tests {
             }
         }
         assert!(!app.busy);
+    }
+    fn text_position(shapes: &[egui::epaint::ClippedShape], label: &str) -> Option<egui::Pos2> {
+        fn find(shape: &egui::Shape, label: &str) -> Option<egui::Pos2> {
+            match shape {
+                egui::Shape::Text(text) if text.galley.text() == label => {
+                    Some(text.pos + text.galley.rect.center().to_vec2())
+                }
+                egui::Shape::Vec(shapes) => shapes.iter().find_map(|s| find(s, label)),
+                _ => None,
+            }
+        }
+        shapes.iter().find_map(|s| find(&s.shape, label))
+    }
+    fn render(app: &mut App, ctx: &egui::Context, events: Vec<egui::Event>) -> egui::FullOutput {
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1280., 800.),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ctx| app.ui(ctx),
+        )
+    }
+    fn click(
+        app: &mut App,
+        ctx: &egui::Context,
+        pos: egui::Pos2,
+        button: egui::PointerButton,
+    ) -> egui::FullOutput {
+        render(
+            app,
+            ctx,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+            ],
+        );
+        render(
+            app,
+            ctx,
+            vec![egui::Event::PointerButton {
+                pos,
+                button,
+                pressed: false,
+                modifiers: Default::default(),
+            }],
+        );
+        render(app, ctx, vec![])
+    }
+    #[test]
+    fn row_context_menu_targets_bank_and_keeps_write_confirmation() {
+        let ctx = egui::Context::default();
+        visual::apply(&ctx);
+        let mut app = app();
+        app.rows = vec![DiskRow {
+            key: "bank:099".into(),
+            name: "FDISK099".into(),
+            kind: "Matching FAT BPB".into(),
+            size: 1_474_560,
+            path: "unused-test-device".into(),
+            bank: Some(99),
+            directory: false,
+            recognized: true,
+        }];
+        render(&mut app, &ctx, vec![]);
+        let output = render(&mut app, &ctx, vec![]);
+        let name = text_position(&output.shapes, "FDISK099").unwrap();
+        // Click in the status column rather than on the filename widget.
+        let output = click(
+            &mut app,
+            &ctx,
+            egui::pos2(1030., name.y),
+            egui::PointerButton::Secondary,
+        );
+        assert_eq!(app.selected, BTreeSet::from(["bank:099".into()]));
+        let position = text_position(&output.shapes, "Replace using expected original…")
+            .expect("bank context menu must be open");
+        click(&mut app, &ctx, position, egui::PointerButton::Primary);
+        let form = app
+            .form
+            .as_ref()
+            .expect("context action should open its prefilled form");
+        assert_eq!(form.command, "bank-write");
+        assert_eq!(form.values[2], "99");
+        assert!(form.confirm);
+        assert!(!form.review);
+        assert!(
+            !app.busy,
+            "opening a write dialog must never execute the write"
+        );
+    }
+    #[test]
+    fn right_click_preserves_group_and_retargets_unselected_rows() {
+        let row = |n| DiskRow {
+            key: format!("bank:{n:03}"),
+            name: format!("FDISK{n:03}"),
+            kind: "Matching FAT BPB".into(),
+            size: 1_474_560,
+            path: "unused-test-device".into(),
+            bank: Some(n),
+            directory: false,
+            recognized: true,
+        };
+        let mut selected = BTreeSet::from([row(0).key, row(1).key]);
+        select_context_row(&mut selected, &row(0));
+        assert_eq!(selected.len(), 2);
+        select_context_row(&mut selected, &row(2));
+        assert_eq!(selected, BTreeSet::from([row(2).key]));
+        let ctx = egui::Context::default();
+        let output = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                assert!(disk_menu(ui, &[row(0), row(1)], false, false).is_none());
+            });
+        });
+        assert!(text_position(&output.shapes, "Export selected disks…").is_some());
+        assert!(text_position(&output.shapes, "Replace bank with recovery…").is_none());
     }
 }

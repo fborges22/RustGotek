@@ -15,6 +15,14 @@ cargo build --release
 ```
 
 Launching without arguments (or with `gui`) opens the egui desktop interface.
+The icon toolbar provides New disk, Import/New layout, Open, Export,
+Replace/Trash, Check, Backup, Convert and Device. The left navigation
+rail switches between the image library and USB banks. Icons have text labels,
+hover descriptions and keyboard focus indicators.
+
+Keyboard shortcuts: **Ctrl/Cmd+N** creates a disk, **Ctrl/Cmd+O** browses for a
+source, **Ctrl/Cmd+F** focuses search, and **F5** refreshes or scans the source.
+Shortcuts pause while a dialog or operation is active.
 
 - **Image library:** choose a folder of disk images or mounted USB files. Search,
   sort columns, select several images with checkboxes, import images, and export
@@ -26,10 +34,17 @@ Launching without arguments (or with `gui`) opens the egui desktop interface.
   continue editing. Files inside FAT12 disks use DOS 8.3 names.
 - **Gotek USB banks:** enter a raw device such as `/dev/sda` or choose a whole-device
   backup, select the bank profile, and click **Scan banks**. Select banks to export
-  them individually or in batches. **Replace disk** takes a replacement image and
+  them individually or in batches. **Replace → Replace bank with recovery** takes a replacement image and
   a new recovery path, then shows the target for review before writing.
-- **More tools:** image checks, HFE conversion, whole-device and folder backups,
-  restores, indexed slots, FlashFloppy configuration and firmware staging.
+- **Toolbar menus:** Check provides filesystem checks and format inspection;
+  Backup groups create, verify and restore; Convert offers raw/HFE conversion;
+  Device contains source reports, indexed slots, FlashFloppy settings and firmware.
+  Dropdown arrows distinguish menus from direct actions.
+- **Context menus:** right-click anywhere on a disk row for actions appropriate
+  to that image or bank. Right-clicking within a multi-selection preserves it for
+  batch export. Right-click files inside a disk to export, rename or remove them.
+  Checks run directly on a selected disk; editing and conversion forms prefill
+  its path. Bank actions automatically prepare a temporary floppy snapshot.
 
 Operations run on background threads. Results appear in the activity log with a
 copy button, and file/folder inputs have native pickers. Existing output files
@@ -40,7 +55,7 @@ On Linux, read-only mounts disable media write actions. The image library takes
 a directory; the bank workspace takes a raw device or whole-device image.
 A tiny FAT volume on a larger USB device exposes only one bank through the normal
 file browser. Folder backups do not capture other banks or boot sectors; use
-**More tools → Disk banks → Back up the whole device** for those.
+**Gotek USB banks → Backup → Create backup** for those.
 
 The GUI uses egui/eframe 0.33 with OpenGL rendering and native dialogs through
 rfd. Linux requires a desktop session; native dialogs use its XDG portal service.
@@ -68,7 +83,8 @@ rustgotek bank-verify /dev/sda ./usb-full.bin
 rustgotek bank-replace ./usb-full.bin gotek1440 1 ./replacement.img ./usb-edited.bin
 ```
 
-The same operations are available under **Gotek USB banks → More tools** in the GUI.
+The same operations are available from the **Gotek USB banks** toolbar menus
+and disk-row context menus.
 Open it with a source prefilled using `cargo run -- gui banks /dev/sda`.
 Linux raw reads
 use UDisks and the desktop authentication dialog if ordinary read permission is
@@ -93,9 +109,9 @@ free space. Keep the source unmounted or read-only and unchanged throughout
 backup and verification. Replacement requires a regular backup file and an
 exactly sized raw floppy image. It creates a new file, preserves padding and
 all other bytes, and reads back the changed bank. All output paths must be new.
-**Replace disk** on a selected table row captures an expected original, saves a
+**Replace → Replace bank with recovery** on a selected table row captures an expected original, saves a
 recovery image, writes the replacement and verifies it after confirmation. For an
-explicit expected-original file, use **More tools → Write a replacement to a bank**.
+explicit expected-original file, use **Replace → Use an expected-original image**.
 The CLI requires the explicit confirmation flag:
 
 ```sh
