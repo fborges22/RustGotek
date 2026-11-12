@@ -1,68 +1,164 @@
 use eframe::egui::{self, Color32, FontId, Rect, Response, Sense, Stroke, StrokeKind, Ui, Vec2};
 
-pub const INK: Color32 = Color32::from_rgb(31, 42, 62);
-pub const MUTED: Color32 = Color32::from_rgb(101, 115, 138);
 pub const BLUE: Color32 = Color32::from_rgb(49, 94, 231);
-pub const PALE: Color32 = Color32::from_rgb(233, 239, 255);
-pub const BORDER: Color32 = Color32::from_rgb(221, 227, 237);
-pub const PAPER: Color32 = Color32::from_rgb(246, 248, 252);
-pub const NAVY: Color32 = Color32::from_rgb(24, 35, 55);
-pub const GREEN: Color32 = Color32::from_rgb(28, 124, 98);
-pub const AMBER: Color32 = Color32::from_rgb(151, 94, 15);
-pub const RED: Color32 = Color32::from_rgb(187, 58, 73);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Appearance {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+impl Appearance {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::System => "System",
+            Self::Light => "Light",
+            Self::Dark => "Dark",
+        }
+    }
+    pub fn parse(value: &str) -> Self {
+        match value {
+            "Light" => Self::Light,
+            "Dark" => Self::Dark,
+            _ => Self::System,
+        }
+    }
+    pub fn preference(self) -> egui::ThemePreference {
+        match self {
+            Self::System => egui::ThemePreference::System,
+            Self::Light => egui::ThemePreference::Light,
+            Self::Dark => egui::ThemePreference::Dark,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct Colors {
+    pub ink: Color32,
+    pub muted: Color32,
+    pub accent: Color32,
+    pub pale: Color32,
+    pub border: Color32,
+    pub paper: Color32,
+    pub surface: Color32,
+    pub nav: Color32,
+    pub green: Color32,
+    pub amber: Color32,
+    pub red: Color32,
+    pub amber_fill: Color32,
+    pub disabled: Color32,
+}
+impl Colors {
+    fn for_theme(theme: egui::Theme) -> Self {
+        if theme == egui::Theme::Dark {
+            Self {
+                ink: Color32::from_rgb(227, 234, 246),
+                muted: Color32::from_rgb(161, 175, 199),
+                accent: Color32::from_rgb(145, 175, 255),
+                pale: Color32::from_rgb(37, 54, 88),
+                border: Color32::from_rgb(57, 71, 94),
+                paper: Color32::from_rgb(18, 25, 37),
+                surface: Color32::from_rgb(26, 35, 50),
+                nav: Color32::from_rgb(13, 20, 32),
+                green: Color32::from_rgb(104, 210, 172),
+                amber: Color32::from_rgb(243, 192, 101),
+                red: Color32::from_rgb(255, 140, 150),
+                amber_fill: Color32::from_rgb(66, 49, 29),
+                disabled: Color32::from_rgb(100, 114, 137),
+            }
+        } else {
+            Self {
+                ink: Color32::from_rgb(31, 42, 62),
+                muted: Color32::from_rgb(101, 115, 138),
+                accent: BLUE,
+                pale: Color32::from_rgb(233, 239, 255),
+                border: Color32::from_rgb(221, 227, 237),
+                paper: Color32::from_rgb(246, 248, 252),
+                surface: Color32::WHITE,
+                nav: Color32::from_rgb(24, 35, 55),
+                green: Color32::from_rgb(28, 124, 98),
+                amber: Color32::from_rgb(151, 94, 15),
+                red: Color32::from_rgb(187, 58, 73),
+                amber_fill: Color32::from_rgb(255, 245, 223),
+                disabled: Color32::from_rgb(157, 166, 183),
+            }
+        }
+    }
+}
+pub fn colors(ctx: &egui::Context) -> Colors {
+    Colors::for_theme(ctx.theme())
+}
 
 pub fn apply(ctx: &egui::Context) {
-    let mut style = (*ctx.style()).clone();
-    style.visuals = egui::Visuals::light();
-    style.visuals.override_text_color = Some(INK);
-    style.visuals.panel_fill = PAPER;
-    style.visuals.window_fill = Color32::WHITE;
-    style.visuals.window_stroke = Stroke::new(1.0f32, BORDER);
-    style.visuals.window_corner_radius = 12.into();
-    style.visuals.extreme_bg_color = Color32::WHITE;
-    style.visuals.faint_bg_color = Color32::from_rgb(249, 250, 253);
-    style.visuals.selection.bg_fill = PALE;
-    style.visuals.selection.stroke = Stroke::new(1.0f32, BLUE);
-    style.visuals.hyperlink_color = BLUE;
-    style.visuals.warn_fg_color = AMBER;
-    style.visuals.error_fg_color = RED;
-    style.visuals.widgets.inactive.bg_fill = Color32::WHITE;
-    style.visuals.widgets.inactive.weak_bg_fill = Color32::WHITE;
-    style.visuals.widgets.inactive.bg_stroke = Stroke::new(1.0f32, BORDER);
-    style.visuals.widgets.hovered.bg_fill = PALE;
-    style.visuals.widgets.hovered.weak_bg_fill = PALE;
-    style.visuals.widgets.hovered.bg_stroke = Stroke::new(1.0f32, BLUE);
-    style.visuals.widgets.active.bg_fill = PALE;
-    style.visuals.widgets.active.weak_bg_fill = PALE;
-    style.visuals.widgets.active.bg_stroke = Stroke::new(1.0f32, BLUE);
-    for widget in [
-        &mut style.visuals.widgets.inactive,
-        &mut style.visuals.widgets.hovered,
-        &mut style.visuals.widgets.active,
-        &mut style.visuals.widgets.noninteractive,
-    ] {
-        widget.fg_stroke = Stroke::new(1.3f32, INK);
-        widget.corner_radius = 6.into();
+    ctx.options_mut(|options| options.fallback_theme = egui::Theme::Light);
+    for theme in [egui::Theme::Light, egui::Theme::Dark] {
+        let c = Colors::for_theme(theme);
+        ctx.style_mut_of(theme, |style| {
+            style.visuals = if theme == egui::Theme::Dark {
+                egui::Visuals::dark()
+            } else {
+                egui::Visuals::light()
+            };
+            style.visuals.override_text_color = Some(c.ink);
+            style.visuals.panel_fill = c.paper;
+            style.visuals.window_fill = c.surface;
+            style.visuals.window_stroke = Stroke::new(1.0f32, c.border);
+            style.visuals.window_corner_radius = 12.into();
+            style.visuals.extreme_bg_color = c.surface;
+            style.visuals.faint_bg_color = c.paper;
+            style.visuals.selection.bg_fill = c.pale;
+            style.visuals.selection.stroke = Stroke::new(1.0f32, c.accent);
+            style.visuals.hyperlink_color = c.accent;
+            style.visuals.warn_fg_color = c.amber;
+            style.visuals.error_fg_color = c.red;
+            style.visuals.widgets.inactive.bg_fill = c.surface;
+            style.visuals.widgets.inactive.weak_bg_fill = c.surface;
+            style.visuals.widgets.inactive.bg_stroke = Stroke::new(1.0f32, c.border);
+            for widget in [
+                &mut style.visuals.widgets.hovered,
+                &mut style.visuals.widgets.active,
+            ] {
+                widget.bg_fill = c.pale;
+                widget.weak_bg_fill = c.pale;
+                widget.bg_stroke = Stroke::new(1.0f32, c.accent);
+            }
+            for widget in [
+                &mut style.visuals.widgets.inactive,
+                &mut style.visuals.widgets.hovered,
+                &mut style.visuals.widgets.active,
+                &mut style.visuals.widgets.noninteractive,
+            ] {
+                widget.fg_stroke = Stroke::new(1.3f32, c.ink);
+                widget.corner_radius = 6.into();
+            }
+            style.visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0f32, c.border);
+            style.visuals.weak_text_color = Some(c.muted);
+            style.spacing.item_spacing = egui::vec2(10., 10.);
+            style.spacing.button_padding = egui::vec2(12., 8.);
+            style.spacing.interact_size.y = 32.;
+            style.spacing.window_margin = 20.into();
+            for text in [egui::TextStyle::Body, egui::TextStyle::Button] {
+                style.text_styles.insert(text, FontId::proportional(14.));
+            }
+            style
+                .text_styles
+                .insert(egui::TextStyle::Small, FontId::proportional(12.));
+            style
+                .text_styles
+                .insert(egui::TextStyle::Heading, FontId::proportional(25.));
+        });
     }
-    style.visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0f32, BORDER);
-    style.spacing.item_spacing = egui::vec2(10.0, 10.0);
-    style.spacing.button_padding = egui::vec2(12.0, 8.0);
-    style.spacing.interact_size.y = 32.0;
-    style.spacing.window_margin = 20.into();
-    for text in [egui::TextStyle::Body, egui::TextStyle::Button] {
-        style.text_styles.insert(text, FontId::proportional(14.0));
-    }
-    style
-        .text_styles
-        .insert(egui::TextStyle::Small, FontId::proportional(12.0));
-    style
-        .text_styles
-        .insert(egui::TextStyle::Heading, FontId::proportional(25.0));
-    ctx.set_style(style);
 }
 
 #[derive(Clone, Copy)]
 pub enum Icon {
+    Minimize,
+    Maximize,
+    RestoreWindow,
+    Monitor,
+    Sun,
+    Moon,
     Edit,
     Disk,
     Add,
@@ -102,6 +198,52 @@ pub fn icon(p: &egui::Painter, rect: Rect, glyph: Icon, color: Color32) {
         );
     };
     match glyph {
+        Icon::Minimize => {
+            line(&[(5., 16.), (19., 16.)]);
+        }
+        Icon::Maximize => {
+            box_at(5., 5., 14., 14.);
+        }
+        Icon::RestoreWindow => {
+            box_at(4., 8., 12., 12.);
+            line(&[(8., 8.), (8., 4.), (20., 4.), (20., 16.), (16., 16.)]);
+        }
+        Icon::Monitor => {
+            box_at(3., 4., 18., 13.);
+            line(&[(12., 17.), (12., 21.)]);
+            line(&[(8., 21.), (16., 21.)]);
+        }
+        Icon::Sun => {
+            p.circle_stroke(point(12., 12.), 4. * scale, stroke);
+            for (ax, ay, bx, by) in [
+                (12., 1., 12., 4.),
+                (12., 20., 12., 23.),
+                (1., 12., 4., 12.),
+                (20., 12., 23., 12.),
+                (4., 4., 6., 6.),
+                (18., 18., 20., 20.),
+                (4., 20., 6., 18.),
+                (18., 6., 20., 4.),
+            ] {
+                line(&[(ax, ay), (bx, by)]);
+            }
+        }
+        Icon::Moon => {
+            line(&[
+                (19., 16.),
+                (16., 21.),
+                (10., 22.),
+                (5., 19.),
+                (2., 14.),
+                (3., 8.),
+                (7., 3.),
+                (10., 2.),
+                (8., 7.),
+                (9., 12.),
+                (13., 16.),
+                (19., 16.),
+            ]);
+        }
         Icon::Edit => {
             line(&[
                 (4., 20.),
@@ -199,7 +341,7 @@ pub fn icon(p: &egui::Painter, rect: Rect, glyph: Icon, color: Color32) {
                 line(&[(3., y), (21., y)]);
             }
             for (x, y) in [(8., 6.), (16., 12.), (10., 18.)] {
-                p.circle_filled(point(x, y), 2.5 * scale, PAPER);
+                p.circle_filled(point(x, y), 2.5 * scale, colors(p.ctx()).surface);
                 p.circle_stroke(point(x, y), 2.5 * scale, stroke);
             }
         }
@@ -243,21 +385,25 @@ pub fn toolbar_button(
         let fill = if primary {
             BLUE
         } else if response.hovered() || response.has_focus() {
-            PALE
+            colors(ui.ctx()).pale
         } else {
             Color32::TRANSPARENT
         };
         let color = if !ui.is_enabled() {
-            Color32::from_rgb(157, 166, 183)
+            colors(ui.ctx()).disabled
         } else if primary {
             Color32::WHITE
         } else {
-            INK
+            colors(ui.ctx()).ink
         };
         ui.painter().rect_filled(rect, 8, fill);
         if response.has_focus() {
-            ui.painter()
-                .rect_stroke(rect, 8, Stroke::new(2.0f32, BLUE), StrokeKind::Inside);
+            ui.painter().rect_stroke(
+                rect,
+                8,
+                Stroke::new(2.0f32, colors(ui.ctx()).accent),
+                StrokeKind::Inside,
+            );
         }
         icon(
             ui.painter(),
@@ -286,7 +432,14 @@ pub fn toolbar_menu(ui: &mut Ui, glyph: Icon, label: &str, hint: &str, enabled: 
             center + egui::vec2(0., 1.5),
             center + egui::vec2(3., -1.5),
         ],
-        Stroke::new(1.2f32, if enabled { MUTED } else { BORDER }),
+        Stroke::new(
+            1.2f32,
+            if enabled {
+                colors(ui.ctx()).muted
+            } else {
+                colors(ui.ctx()).border
+            },
+        ),
     );
     response
 }
@@ -296,7 +449,11 @@ pub fn small_button(ui: &mut Ui, glyph: Icon, label: &str) -> Response {
         32.0
     } else {
         ui.painter()
-            .layout_no_wrap(label.into(), FontId::proportional(13.0), INK)
+            .layout_no_wrap(
+                label.into(),
+                FontId::proportional(13.0),
+                colors(ui.ctx()).ink,
+            )
             .size()
             .x
             + 44.0
@@ -309,22 +466,33 @@ pub fn small_button(ui: &mut Ui, glyph: Icon, label: &str) -> Response {
         rect,
         6,
         if response.hovered() || response.has_focus() {
-            PALE
+            colors(ui.ctx()).pale
         } else {
-            Color32::WHITE
+            colors(ui.ctx()).surface
         },
     );
     ui.painter().rect_stroke(
         rect,
         6,
-        Stroke::new(1.0f32, if response.has_focus() { BLUE } else { BORDER }),
+        Stroke::new(
+            1.0f32,
+            if response.has_focus() {
+                BLUE
+            } else {
+                colors(ui.ctx()).border
+            },
+        ),
         StrokeKind::Inside,
     );
     icon(
         ui.painter(),
         Rect::from_min_size(rect.min + egui::vec2(7., 7.), Vec2::splat(18.)),
         glyph,
-        if ui.is_enabled() { MUTED } else { BORDER },
+        if ui.is_enabled() {
+            colors(ui.ctx()).muted
+        } else {
+            colors(ui.ctx()).border
+        },
     );
     if !label.is_empty() {
         ui.painter().text(
@@ -332,7 +500,7 @@ pub fn small_button(ui: &mut Ui, glyph: Icon, label: &str) -> Response {
             egui::Align2::LEFT_CENTER,
             label,
             FontId::proportional(13.),
-            INK,
+            colors(ui.ctx()).ink,
         );
     }
     response
@@ -393,12 +561,13 @@ pub fn badge(ui: &mut Ui, label: &str, color: Color32, fill: Color32) {
 pub fn empty_art(ui: &mut Ui, glyph: Icon) {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(130., 100.), Sense::hover());
     let center = rect.center();
-    ui.painter().circle_filled(center, 44., PALE);
+    ui.painter()
+        .circle_filled(center, 44., colors(ui.ctx()).pale);
     icon(
         ui.painter(),
         Rect::from_center_size(center, Vec2::splat(48.)),
         glyph,
-        BLUE,
+        colors(ui.ctx()).accent,
     );
     for (dx, dy, r) in [(-51., -24., 3.), (51., 12., 4.), (36., -38., 2.)] {
         ui.painter().circle_filled(
@@ -452,5 +621,41 @@ pub fn app_icon() -> egui::IconData {
         rgba,
         width: 64,
         height: 64,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn system_theme_changes_and_manual_overrides_update_all_surfaces() {
+        let ctx = egui::Context::default();
+        apply(&ctx);
+        for (preference, system, expected) in [
+            (Appearance::System, egui::Theme::Dark, egui::Theme::Dark),
+            (Appearance::System, egui::Theme::Light, egui::Theme::Light),
+            (Appearance::Dark, egui::Theme::Light, egui::Theme::Dark),
+            (Appearance::Light, egui::Theme::Dark, egui::Theme::Light),
+        ] {
+            ctx.set_theme(preference.preference());
+            let _ = ctx.run(
+                egui::RawInput {
+                    system_theme: Some(system),
+                    ..Default::default()
+                },
+                |ctx| {
+                    assert_eq!(ctx.theme(), expected);
+                    let c = colors(ctx);
+                    assert_eq!(ctx.style().visuals.window_fill, c.surface);
+                    assert_eq!(ctx.style().visuals.panel_fill, c.paper);
+                    assert_eq!(ctx.style().visuals.override_text_color, Some(c.ink));
+                    assert_ne!(c.ink, c.surface);
+                },
+            );
+        }
+        for choice in [Appearance::System, Appearance::Dark, Appearance::Light] {
+            assert_eq!(Appearance::parse(choice.name()), choice);
+        }
+        assert_eq!(Appearance::parse("invalid"), Appearance::System);
     }
 }

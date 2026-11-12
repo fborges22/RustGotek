@@ -24,6 +24,17 @@ Keyboard shortcuts: **Ctrl/Cmd+N** creates a disk, **Ctrl/Cmd+O** browses for a
 source, **Ctrl/Cmd+F** focuses search, and **F5** refreshes or scans the source.
 Shortcuts pause while a dialog or operation is active.
 
+The app draws its own title bar and minimize, maximize/restore and close buttons.
+Drag the title bar to move the window, double-click it to maximize/restore, and
+use the window edges or corners to resize. Close is disabled while an operation is active; cancel an open file picker
+before closing.
+
+The title-bar appearance menu offers **System**, **Light** and **Dark**. The
+selection is saved between launches. System follows native appearance signals;
+on Linux it also watches the [desktop Settings portal](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.Settings.html)
+for changes. If the desktop reports no preference, System uses the light theme.
+
+
 - **Image library:** choose a folder of disk images or mounted USB files. Search,
   sort columns, select several images with checkboxes, import images, and export
   the selection. Double-click a folder to navigate or a FAT12 disk to browse it.

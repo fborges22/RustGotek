@@ -1,3 +1,5 @@
+mod appearance;
+mod chrome;
 mod visual;
 use eframe::egui::{self, Color32, RichText};
 use egui_extras::{Column, TableBuilder};
@@ -12,6 +14,9 @@ use visual::Icon;
 pub fn launch(bank_source: Option<String>) -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
+            .with_decorations(false)
+            .with_resizable(true)
+            .with_app_id("org.rustgotek.RustGotek")
             .with_inner_size([1280.0, 860.0])
             .with_min_inner_size([900.0, 640.0])
             .with_icon(Arc::new(visual::app_icon())),
@@ -22,7 +27,15 @@ pub fn launch(bank_source: Option<String>) -> eframe::Result {
         options,
         Box::new(move |cc| {
             visual::apply(&cc.egui_ctx);
-            Ok(Box::new(App::new(bank_source, &cc.egui_ctx)))
+            appearance::watch_system_theme(&cc.egui_ctx);
+            let mut app = App::new(bank_source, &cc.egui_ctx);
+            app.appearance = cc
+                .storage
+                .and_then(|s| s.get_string("appearance"))
+                .map(|s| visual::Appearance::parse(&s))
+                .unwrap_or_default();
+            cc.egui_ctx.set_theme(app.appearance.preference());
+            Ok(Box::new(app))
         }),
     )
 }
@@ -594,6 +607,7 @@ enum Event {
     Source(Option<PathBuf>),
 }
 struct App {
+    appearance: visual::Appearance,
     workspace: Workspace,
     root: String,
     source: String,
@@ -624,6 +638,7 @@ impl App {
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default();
         let mut app = Self {
+            appearance: visual::Appearance::System,
             workspace: if bank_source.is_some() {
                 Workspace::Banks
             } else {
@@ -1132,6 +1147,12 @@ impl App {
 }
 
 impl eframe::App for App {
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        storage.set_string("appearance", self.appearance.name().into());
+    }
+    fn persist_egui_memory(&self) -> bool {
+        false
+    }
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.ui(ctx);
     }
@@ -1140,38 +1161,23 @@ impl App {
     fn ui(&mut self, ctx: &egui::Context) {
         self.receive(ctx);
         self.shortcuts(ctx);
-        egui::TopBottomPanel::top("brand")
-            .frame(
-                egui::Frame::new()
-                    .fill(Color32::WHITE)
-                    .inner_margin(egui::Margin::symmetric(20, 12)),
-            )
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    let (rect, _) =
-                        ui.allocate_exact_size(egui::vec2(34., 34.), egui::Sense::hover());
-                    ui.painter().rect_filled(rect, 8, visual::BLUE);
-                    visual::icon(ui.painter(), rect.shrink(7.), Icon::Disk, Color32::WHITE);
-                    ui.label(RichText::new("RustGotek").size(22.).strong());
-                    ui.add_space(12.);
-                    ui.label(RichText::new("DISK MANAGER").size(11.).color(visual::MUTED));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        visual::badge(
-                            ui,
-                            if self.busy { "WORKING" } else { "READY" },
-                            visual::GREEN,
-                            Color32::from_rgb(232, 245, 239),
-                        );
-                        if self.busy {
-                            ui.spinner();
-                        }
-                    });
-                });
-            });
+        if self.busy && ctx.input(|i| i.viewport().close_requested()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        }
+        chrome::title_bar(
+            ctx,
+            &mut self.appearance,
+            self.busy,
+            if self.workspace == Workspace::Banks {
+                "Gotek USB banks"
+            } else {
+                "Image library"
+            },
+        );
         egui::TopBottomPanel::bottom("status")
             .frame(
                 egui::Frame::new()
-                    .fill(Color32::WHITE)
+                    .fill(visual::colors(ctx).surface)
                     .inner_margin(egui::Margin::symmetric(16, 8)),
             )
             .show(ctx, |ui| {
@@ -1182,17 +1188,17 @@ impl App {
                         r,
                         if self.error { Icon::Close } else { Icon::Check },
                         if self.error {
-                            visual::RED
+                            visual::colors(ctx).red
                         } else {
-                            visual::GREEN
+                            visual::colors(ctx).green
                         },
                     );
                     ui.add(
                         egui::Label::new(RichText::new(&self.status).size(12.).color(
                             if self.error {
-                                visual::RED
+                                visual::colors(ctx).red
                             } else {
-                                visual::MUTED
+                                visual::colors(ctx).muted
                             },
                         ))
                         .truncate(),
@@ -1223,7 +1229,7 @@ impl App {
             .exact_width(86.)
             .frame(
                 egui::Frame::new()
-                    .fill(visual::NAVY)
+                    .fill(visual::colors(ctx).nav)
                     .inner_margin(egui::Margin::symmetric(10, 18)),
             )
             .show(ctx, |ui| {
@@ -1262,7 +1268,7 @@ impl App {
         egui::TopBottomPanel::top("action-toolbar")
             .frame(
                 egui::Frame::new()
-                    .fill(Color32::WHITE)
+                    .fill(visual::colors(ctx).surface)
                     .inner_margin(egui::Margin::symmetric(18, 10)),
             )
             .show(ctx, |ui| {
@@ -1273,7 +1279,7 @@ impl App {
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
-                    .fill(visual::PAPER)
+                    .fill(visual::colors(ctx).paper)
                     .inner_margin(egui::Margin::symmetric(24, 20)),
             )
             .show(ctx, |ui| {
@@ -1283,6 +1289,7 @@ impl App {
             });
         self.preview_window(ctx);
         self.form_window(ctx);
+        chrome::resize_borders(ctx);
     }
     fn switch_workspace(&mut self, mode: Workspace, ctx: &egui::Context) {
         if self.workspace == mode {
@@ -1363,7 +1370,7 @@ impl App {
                     } else {
                         "A home for your floppy collection."
                     })
-                    .color(visual::MUTED),
+                    .color(visual::colors(ui.ctx()).muted),
                 );
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1375,18 +1382,23 @@ impl App {
                         } else {
                             "720 KB / BANK"
                         },
-                        visual::BLUE,
-                        visual::PALE,
+                        visual::colors(ui.ctx()).accent,
+                        visual::colors(ui.ctx()).pale,
                     );
                 } else {
-                    visual::badge(ui, "LOCAL IMAGES", visual::BLUE, visual::PALE);
+                    visual::badge(
+                        ui,
+                        "LOCAL IMAGES",
+                        visual::colors(ui.ctx()).accent,
+                        visual::colors(ui.ctx()).pale,
+                    );
                 }
             });
         });
         ui.add_space(16.);
         egui::Frame::new()
-            .fill(Color32::WHITE)
-            .stroke(egui::Stroke::new(1.0f32, visual::BORDER))
+            .fill(visual::colors(ui.ctx()).surface)
+            .stroke(egui::Stroke::new(1.0f32, visual::colors(ui.ctx()).border))
             .corner_radius(10)
             .inner_margin(14)
             .show(ui, |ui| {
@@ -1396,7 +1408,12 @@ impl App {
         ui.add_space(16.);
         ui.horizontal_wrapped(|ui| {
             let (r, _) = ui.allocate_exact_size(egui::vec2(18., 18.), egui::Sense::hover());
-            visual::icon(ui.painter(), r, Icon::Search, visual::MUTED);
+            visual::icon(
+                ui.painter(),
+                r,
+                Icon::Search,
+                visual::colors(ui.ctx()).muted,
+            );
             ui.add(
                 egui::TextEdit::singleline(&mut self.filter)
                     .id(egui::Id::new("disk-search"))
@@ -1422,21 +1439,21 @@ impl App {
                     visual::badge(
                         ui,
                         &format!("{} selected", self.selected.len()),
-                        visual::BLUE,
-                        visual::PALE,
+                        visual::colors(ui.ctx()).accent,
+                        visual::colors(ui.ctx()).pale,
                     );
                 }
                 ui.label(
                     RichText::new(format!("{} shown", self.visible().len()))
                         .size(12.)
-                        .color(visual::MUTED),
+                        .color(visual::colors(ui.ctx()).muted),
                 );
             });
         });
         ui.add_space(10.);
         egui::Frame::new()
-            .fill(Color32::WHITE)
-            .stroke(egui::Stroke::new(1.0f32, visual::BORDER))
+            .fill(visual::colors(ui.ctx()).surface)
+            .stroke(egui::Stroke::new(1.0f32, visual::colors(ui.ctx()).border))
             .corner_radius(10)
             .inner_margin(12)
             .show(ui, |ui| {
@@ -1452,7 +1469,7 @@ impl App {
                 ui.painter(),
                 r,
                 if banks { Icon::Drive } else { Icon::Folder },
-                visual::BLUE,
+                visual::colors(ui.ctx()).accent,
             );
             ui.label(
                 RichText::new(if banks {
@@ -1462,13 +1479,13 @@ impl App {
                 })
                 .size(11.)
                 .strong()
-                .color(visual::MUTED),
+                .color(visual::colors(ui.ctx()).muted),
             );
             if let Some(catalog) = &self.bank_catalog {
                 ui.label(
                     RichText::new(format!("{} capacity", format_size(catalog.size)))
                         .size(12.)
-                        .color(visual::MUTED),
+                        .color(visual::colors(ui.ctx()).muted),
                 );
             }
         });
@@ -1554,14 +1571,14 @@ impl App {
                     ui.label(
                         RichText::new(dir.display().to_string())
                             .size(12.)
-                            .color(visual::MUTED),
+                            .color(visual::colors(ui.ctx()).muted),
                     );
                     if readonly {
                         visual::badge(
                             ui,
                             "READ ONLY",
-                            visual::AMBER,
-                            Color32::from_rgb(255, 245, 223),
+                            visual::colors(ui.ctx()).amber,
+                            visual::colors(ui.ctx()).amber_fill,
                         );
                     }
                 });
@@ -1740,7 +1757,7 @@ impl App {
         ui.label(
             RichText::new(if banks { "WHOLE DEVICE" } else { "OPEN FOLDER" })
                 .small()
-                .color(visual::MUTED),
+                .color(visual::colors(ui.ctx()).muted),
         );
         if menu_item(ui, "Create backup…", available) {
             self.open_form(if banks { "bank-backup" } else { "backup" });
@@ -1773,7 +1790,7 @@ impl App {
             ui.label(
                 RichText::new("FlashFloppy file tools are in Image library.")
                     .small()
-                    .color(visual::MUTED),
+                    .color(visual::colors(ui.ctx()).muted),
             );
             if menu_item(ui, "Open mounted media folder…", true) {
                 self.worker(ctx, "Choose a mounted media folder…", || {
@@ -1806,7 +1823,7 @@ impl App {
             ui.label(
                 RichText::new("Open a mounted folder in Image library for media actions.")
                     .small()
-                    .color(visual::MUTED),
+                    .color(visual::colors(ui.ctx()).muted),
             );
         }
     }
@@ -2033,7 +2050,7 @@ impl App {
                                     } else {
                                         Icon::Disk
                                     },
-                                    visual::BLUE,
+                                    visual::colors(ui.ctx()).accent,
                                 );
                                 ui.selectable_label(chosen, &row.name)
                             })
@@ -2053,7 +2070,7 @@ impl App {
                     tr.col(|ui| {
                         ui.add(
                             egui::Label::new(RichText::new(&row.kind).color(if row.recognized {
-                                visual::GREEN
+                                visual::colors(ui.ctx()).green
                             } else {
                                 Color32::GRAY
                             }))
@@ -2117,7 +2134,10 @@ impl App {
                     }
                     ui.separator();
                     if form.review {
-                        ui.colored_label(visual::AMBER, "Review before changing data");
+                        ui.colored_label(
+                            visual::colors(ui.ctx()).amber,
+                            "Review before changing data",
+                        );
                         for (label, value) in form.labels.iter().zip(&form.values) {
                             ui.label(RichText::new(label).strong());
                             ui.label(value);
@@ -2195,7 +2215,10 @@ impl App {
                         let readonly =
                             form.writes_media && self.listing.as_ref().is_some_and(|l| l.read_only);
                         if readonly {
-                            ui.colored_label(visual::AMBER, "This media is read-only.");
+                            ui.colored_label(
+                                visual::colors(ui.ctx()).amber,
+                                "This media is read-only.",
+                            );
                         }
                         let valid = form.args(&self.root).is_ok() && !readonly;
                         if ui
@@ -2429,7 +2452,11 @@ fn disk_menu(
 ) -> Option<DiskAction> {
     let mut action = None;
     if let [row] = rows {
-        ui.label(RichText::new(&row.name).small().color(visual::MUTED));
+        ui.label(
+            RichText::new(&row.name)
+                .small()
+                .color(visual::colors(ui.ctx()).muted),
+        );
         ui.separator();
         if menu_item(
             ui,
@@ -2448,7 +2475,7 @@ fn disk_menu(
         ui.label(
             RichText::new(format!("{} disks selected", rows.len()))
                 .small()
-                .color(visual::MUTED),
+                .color(visual::colors(ui.ctx()).muted),
         );
     }
     if menu_item(
@@ -2545,7 +2572,7 @@ fn toolbar_divider(ui: &mut egui::Ui) {
             rect.center_top() + egui::vec2(0., 12.),
             rect.center_bottom() - egui::vec2(0., 12.),
         ],
-        egui::Stroke::new(1.0f32, visual::BORDER),
+        egui::Stroke::new(1.0f32, visual::colors(ui.ctx()).border),
     );
 }
 fn new_image_path(directory: &Path, stem: &str) -> PathBuf {
@@ -3057,5 +3084,55 @@ mod tests {
         });
         assert!(text_position(&output.shapes, "Export selected disks…").is_some());
         assert!(text_position(&output.shapes, "Replace bank with recovery…").is_none());
+    }
+    #[test]
+    fn operating_system_close_waits_for_active_operation() {
+        let ctx = egui::Context::default();
+        let mut app = app();
+        app.busy = true;
+        let mut input = egui::RawInput::default();
+        input
+            .viewports
+            .entry(egui::ViewportId::ROOT)
+            .or_default()
+            .events
+            .push(egui::ViewportEvent::Close);
+        let output = ctx.run(input, |ctx| app.ui(ctx));
+        assert!(
+            output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .contains(&egui::ViewportCommand::CancelClose)
+        );
+    }
+    #[test]
+    fn appearance_menu_changes_theme_and_saves_preference() {
+        #[derive(Default)]
+        struct Storage(std::collections::HashMap<String, String>);
+        impl eframe::Storage for Storage {
+            fn get_string(&self, key: &str) -> Option<String> {
+                self.0.get(key).cloned()
+            }
+            fn set_string(&mut self, key: &str, value: String) {
+                self.0.insert(key.into(), value);
+            }
+            fn flush(&mut self) {}
+        }
+        let ctx = egui::Context::default();
+        visual::apply(&ctx);
+        let mut app = app();
+        render(&mut app, &ctx, vec![]);
+        let output = render(&mut app, &ctx, vec![]);
+        let theme = text_position(&output.shapes, "System").unwrap();
+        let output = click(&mut app, &ctx, theme, egui::PointerButton::Primary);
+        let dark = text_position(&output.shapes, "Dark").expect("appearance menu must open");
+        click(&mut app, &ctx, dark, egui::PointerButton::Primary);
+        assert_eq!(app.appearance, visual::Appearance::Dark);
+        assert_eq!(ctx.theme(), egui::Theme::Dark);
+        let mut storage = Storage::default();
+        eframe::App::save(&mut app, &mut storage);
+        assert_eq!(
+            storage.0.get("appearance").map(String::as_str),
+            Some("Dark")
+        );
     }
 }
