@@ -83,14 +83,9 @@ fn open_read_only(path: &Path) -> Result<File> {
 }
 
 #[cfg(target_os = "linux")]
-fn linux_authorized_open(path: &Path, write: bool) -> Result<File> {
-    use std::{collections::HashMap, os::unix::fs::MetadataExt, time::Duration};
-    use zbus::{
-        blocking::{Proxy, connection::Builder},
-        proxy::MethodFlags,
-        zvariant::{OwnedFd, Value},
-    };
-    let expected_device = fs::metadata(path)?.rdev();
+pub(crate) fn linux_system_connection() -> Result<zbus::blocking::Connection> {
+    use std::time::Duration;
+    use zbus::blocking::connection::Builder;
     // Keep the same D-Bus caller for the application's lifetime so polkit can
     // reuse its retained authorization. Failed/cancelled authorization is not
     // cached, and device descriptors remain scoped to each operation.
@@ -109,6 +104,19 @@ fn linux_authorized_open(path: &Path, write: bool) -> Result<File> {
         }
         cached.as_ref().unwrap().clone()
     };
+    Ok(connection)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_authorized_open(path: &Path, write: bool) -> Result<File> {
+    use std::{collections::HashMap, os::unix::fs::MetadataExt};
+    use zbus::{
+        blocking::Proxy,
+        proxy::MethodFlags,
+        zvariant::{OwnedFd, Value},
+    };
+    let expected_device = fs::metadata(path)?.rdev();
+    let connection = linux_system_connection()?;
     let manager = Proxy::new(
         &connection,
         "org.freedesktop.UDisks2",

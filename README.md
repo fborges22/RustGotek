@@ -71,6 +71,22 @@ for changes. If the desktop reports no preference, System uses the light theme.
   Checks run directly on a selected disk; editing and conversion forms prefill
   its path. Bank actions automatically prepare a temporary floppy snapshot.
 
+On Linux, **Device → Safely eject USB…** identifies the USB behind the current
+raw-device source or mounted folder and shows all affected volumes for review.
+Click **Eject and power off** to unmount them and request safe power-off through
+UDisks2. Wait for **USB powered off — safe to unplug** before removing it.
+Busy volumes stop the operation; close files using the drive and try again.
+A failed attempt may leave some volumes unmounted without powering off the USB.
+The action reuses system authorization and requests it when necessary. It rejects
+image files, non-USB drives and devices without power-off support. Other platforms
+should use their operating system's eject action. CLI equivalent:
+
+```sh
+rustgotek usb-eject /dev/sda --confirm-eject
+# A mounted USB folder is also accepted:
+rustgotek usb-eject /media/USB --confirm-eject
+```
+
 Operations run on background threads. Results appear in the activity log with a
 copy button, and file/folder inputs have native pickers. Existing output files
 are never overwritten by export and copy operations. Disk-editor saves update

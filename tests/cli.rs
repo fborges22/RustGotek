@@ -1600,3 +1600,16 @@ fn disk_labels_update_both_records_and_preserve_files_and_originals() {
     );
     assert_eq!(fs::read(s.0.join("renamed.img")).unwrap(), labelled);
 }
+
+#[test]
+fn usb_eject_requires_explicit_confirmation_and_refuses_image_files() {
+    let s = Sandbox::new();
+    fs::write(s.0.join("disk.img"), b"unchanged").unwrap();
+    assert!(!s.run(&["usb-eject", "disk.img"]).status.success());
+    assert!(
+        !s.run(&["usb-eject", "disk.img", "--confirm-eject"])
+            .status
+            .success()
+    );
+    assert_eq!(fs::read(s.0.join("disk.img")).unwrap(), b"unchanged");
+}

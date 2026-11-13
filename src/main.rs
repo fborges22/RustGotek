@@ -7,6 +7,7 @@ mod gui;
 mod hfe;
 mod media;
 mod slots;
+mod usb;
 
 use std::{
     env, fs,
@@ -22,6 +23,7 @@ const HELP: &str = "rustgotek — manage mounted Gotek USB media
 Commands:
   gui                              Open the desktop interface (also the default)
   gui banks [SOURCE]               Open Disk banks, optionally prefill the source
+  usb-eject SOURCE --confirm-eject Unmount and power off a USB drive (Linux)
   bank-list SOURCE PROFILE         Inspect fixed-stride bank boot headers
   bank-create OUT PROFILE COUNT CAPACITY_BYTES|minimum
                                    Create a new formatted bank-layout image
@@ -283,6 +285,11 @@ fn run(a: &[String]) -> Result<()> {
     match a.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
         [] | ["help"] | ["--help"] | ["-h"] => print!("{HELP}"),
         ["--version"] => println!("rustgotek {}", env!("CARGO_PKG_VERSION")),
+        ["usb-eject", source, "--confirm-eject"] => {
+            let plan = usb::prepare(Path::new(source))?;
+            usb::power_off(&plan)?;
+            println!("USB powered off. Safe to unplug.");
+        }
         ["bank-list", source, profile] => banks::list(Path::new(source), profile)?,
         ["bank-create", dest, profile, count, capacity] => {
             banks::create_layout(Path::new(dest), profile, count.parse()?, capacity)?

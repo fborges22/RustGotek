@@ -581,6 +581,7 @@ struct Form {
     keepalive: Option<Arc<tempfile::TempDir>>,
     editor: Option<Preview>,
     batch: Option<Vec<DiskEdit>>,
+    eject: Option<crate::usb::Plan>,
 }
 impl Form {
     fn operation(op: &Operation) -> Self {
@@ -598,6 +599,7 @@ impl Form {
             keepalive: None,
             editor: None,
             batch: None,
+            eject: None,
         }
     }
     fn bind_editor(&mut self, preview: &Preview) {
@@ -659,6 +661,7 @@ enum Event {
     Picked(usize, Option<PathBuf>),
     Folder(Option<PathBuf>),
     Source(Option<PathBuf>),
+    Ejected,
 }
 struct App {
     appearance: visual::Appearance,
@@ -774,6 +777,16 @@ impl App {
                     self.error = true;
                     self.status = "Operation failed — correct the fields and try again".into();
                     self.log = error;
+                    self.show_log = true;
+                }
+                Ok(Event::Ejected) => {
+                    self.clear();
+                    self.root.clear();
+                    self.source.clear();
+                    self.form = None;
+                    self.error = false;
+                    self.status = "USB powered off — safe to unplug".into();
+                    self.log = self.status.clone();
                     self.show_log = true;
                 }
                 Ok(Event::Listed(listing)) => {
@@ -1126,6 +1139,7 @@ impl App {
             keepalive: None,
             editor: None,
             batch: None,
+            eject: None,
         });
     }
     fn execute_form(&mut self, ctx: &egui::Context) {
@@ -1145,6 +1159,13 @@ impl App {
                 return;
             }
         };
+        if let Some(plan) = form.eject {
+            self.worker(ctx, "Unmounting USB and powering it off…", move || {
+                crate::usb::power_off(&plan).map_err(|e| e.to_string())?;
+                Ok(Event::Ejected)
+            });
+            return;
+        }
         if form.editor.is_some() {
             self.worker(
                 ctx,
@@ -1870,6 +1891,34 @@ impl App {
         }
     }
     fn device_menu(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let source = if self.workspace == Workspace::Banks {
+            &self.source
+        } else {
+            &self.root
+        };
+        if menu_item(
+            ui,
+            "Safely eject USB…",
+            cfg!(target_os = "linux") && !source.trim().is_empty(),
+        ) {
+            let source = PathBuf::from(source);
+            self.worker(ctx, "Identifying USB drive…", move || {
+                let plan = crate::usb::prepare(&source).map_err(|e| e.to_string())?;
+                let mut form =
+                    Form::operation(OPS.iter().find(|op| op.command == "bank-list").unwrap());
+                form.title = "Safely eject USB".into();
+                form.command = "usb-eject".into();
+                form.description = plan.description();
+                form.labels = vec!["Selected USB source".into()];
+                form.values = vec![source.to_string_lossy().into_owned()];
+                form.kinds = vec![Kind::Text];
+                form.confirm = true;
+                form.review = true;
+                form.eject = Some(plan);
+                Ok(Event::Prepared(form))
+            });
+        }
+        ui.separator();
         if self.workspace == Workspace::Banks {
             if menu_item(ui, "Refresh bank table", !self.source.trim().is_empty()) {
                 self.scan(ctx);
@@ -1934,6 +1983,7 @@ impl App {
             keepalive: None,
             editor: None,
             batch: None,
+            eject: None,
         });
     }
     fn disk_command(&mut self, ctx: &egui::Context, command: &'static str) {
@@ -2254,9 +2304,13 @@ impl App {
                             if ui
                                 .add(
                                     egui::Button::new(
-                                        RichText::new("Confirm and run")
-                                            .strong()
-                                            .color(Color32::WHITE),
+                                        RichText::new(if form.eject.is_some() {
+                                            "Eject and power off"
+                                        } else {
+                                            "Confirm and run"
+                                        })
+                                        .strong()
+                                        .color(Color32::WHITE),
                                     )
                                     .fill(visual::BLUE),
                                 )
@@ -2284,6 +2338,10 @@ impl App {
                                         continue;
                                     }
                                     ui.label(&form.labels[i]);
+                                    if form.eject.is_some() {
+                                        ui.label(&form.values[i]);
+                                        continue;
+                                    }
                                     if i == 0
                                         && form.command.starts_with("image-")
                                         && self
@@ -3691,6 +3749,24 @@ mod tests {
                 .unwrap()
                 .contains("link")
         );
+    }
+
+    #[test]
+    fn successful_ejection_clears_sources_without_scanning_the_removed_drive() {
+        let ctx = egui::Context::default();
+        let mut app = app();
+        app.root = "/media/USB".into();
+        app.source = "/dev/test-usb".into();
+        app.selected.insert("bank:051".into());
+        app.busy = true;
+        app.sender.send(Ok(Event::Ejected)).unwrap();
+        app.receive(&ctx);
+        assert!(!app.busy);
+        assert!(!app.error);
+        assert!(app.root.is_empty() && app.source.is_empty());
+        assert!(app.rows.is_empty() && app.selected.is_empty());
+        assert!(app.preview.is_none());
+        assert!(app.status.contains("safe to unplug"));
     }
 
     #[test]
