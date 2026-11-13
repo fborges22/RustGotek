@@ -562,6 +562,7 @@ struct Preview {
     entries: Vec<crate::fat12::DiskEntry>,
     temp: Option<Arc<tempfile::TempDir>>,
     selected: Option<String>,
+    checked: BTreeSet<String>,
     title: String,
     label: String,
 }
@@ -579,6 +580,7 @@ struct Form {
     review: bool,
     keepalive: Option<Arc<tempfile::TempDir>>,
     editor: Option<Preview>,
+    batch: Option<Vec<DiskEdit>>,
 }
 impl Form {
     fn operation(op: &Operation) -> Self {
@@ -595,6 +597,7 @@ impl Form {
             review: false,
             keepalive: None,
             editor: None,
+            batch: None,
         }
     }
     fn bind_editor(&mut self, preview: &Preview) {
@@ -1122,6 +1125,7 @@ impl App {
             review: false,
             keepalive: None,
             editor: None,
+            batch: None,
         });
     }
     fn execute_form(&mut self, ctx: &egui::Context) {
@@ -1929,6 +1933,7 @@ impl App {
             review: false,
             keepalive: None,
             editor: None,
+            batch: None,
         });
     }
     fn disk_command(&mut self, ctx: &egui::Context, command: &'static str) {
@@ -2264,7 +2269,15 @@ impl App {
                         egui::ScrollArea::vertical()
                             .max_height(440.0)
                             .show(ui, |ui| {
+                                if let Some(edits) = &form.batch {
+                                    for edit in edits {
+                                        ui.label(edit.description());
+                                    }
+                                }
                                 for i in 0..form.values.len() {
+                                    if form.batch.is_some() {
+                                        continue;
+                                    }
                                     if form.editor.is_some()
                                         && (i == 0 || i == form.values.len() - 1)
                                     {
@@ -2405,6 +2418,8 @@ impl App {
         let mut directory = None;
         let mut action = None;
         let mut extract = false;
+        let mut import_batch = None;
+        let mut remove_batch = false;
         egui::Window::new(format!("Disk contents — {}", preview.title))
             .id(egui::Id::new("preview")).open(&mut open).default_size([720.0, 510.0])
             .show(ctx, |ui| {
@@ -2430,45 +2445,92 @@ impl App {
                     });
                     ui.horizontal_wrapped(|ui| {
                         if visual::small_button(ui, Icon::Check, "Check disk").clicked() { action = Some("image-check"); }
-                        if visual::small_button(ui, Icon::Import, "Add file").clicked() { action = Some("image-import"); }
+                        if visual::small_button(ui, Icon::Import, "Add files").clicked() { import_batch = Some(false); }
+                        if visual::small_button(ui, Icon::Folder, "Add folders").clicked() { import_batch = Some(true); }
                         if visual::small_button(ui, Icon::Folder, "New folder").clicked() { action = Some("image-mkdir"); }
                     });
                     ui.horizontal_wrapped(|ui| {
-                        let selected = preview.selected.as_ref().and_then(|s| preview.entries.iter().find(|e| &e.name == s));
+                        let selected = preview.selected.as_ref().filter(|_| preview.checked.len() <= 1).and_then(|s| preview.entries.iter().find(|e| &e.name == s));
                         if ui.add_enabled_ui(selected.is_some_and(|e| e.directory), |ui| visual::small_button(ui, Icon::Folder, "Open folder")).inner.clicked() {
                             directory = selected.map(|e| inner_path(&preview.directory, &e.name));
                         }
                         if ui.add_enabled_ui(selected.is_some_and(|e| !e.directory), |ui| visual::small_button(ui, Icon::Export, "Export file")).inner.clicked() { extract = true; }
                         if ui.add_enabled_ui(selected.is_some(), |ui| visual::small_button(ui, Icon::Edit, "Rename")).inner.clicked() { action = Some("image-rename"); }
-                        if ui.add_enabled_ui(selected.is_some(), |ui| visual::small_button(ui, Icon::Trash, "Remove")).inner.clicked() { action = Some("image-remove"); }
+                        if ui.add_enabled_ui(!preview.checked.is_empty(), |ui| visual::small_button(ui, Icon::Trash, "Remove selected")).inner.clicked() { remove_batch = true; }
                     });
                     ui.separator();
+                    ui.horizontal(|ui| {
+                        if ui.small_button("Select all").clicked() {
+                            preview.checked = preview.entries.iter().map(|e| e.name.clone()).collect();
+                            preview.selected = preview.checked.iter().next().cloned();
+                        }
+                        if ui.small_button("Clear selection").clicked() { preview.checked.clear(); preview.selected = None; }
+                        ui.label(format!("{} selected", preview.checked.len()));
+                    });
                     TableBuilder::new(ui).id_salt("contents-table").striped(true)
                         .column(Column::remainder()).column(Column::initial(80.0)).column(Column::initial(100.0))
                         .max_scroll_height(280.0).header(28.0, |mut h| {
                             for name in ["Name", "Type", "Size"] { h.col(|ui| { ui.strong(name); }); }
                         }).body(|body| body.rows(30.0, preview.entries.len(), |mut tr| {
                             let e = &preview.entries[tr.index()];
-                            tr.col(|ui| {
-                                let response = ui.selectable_label(preview.selected.as_ref() == Some(&e.name), &e.name);
-                                if response.clicked() || response.secondary_clicked() { preview.selected = Some(e.name.clone()); }
+                            tr.col(|ui| { ui.horizontal(|ui| {
+                                let mut checked = preview.checked.contains(&e.name);
+                                if ui.checkbox(&mut checked, "").changed() {
+                                    if checked { preview.checked.insert(e.name.clone()); } else { preview.checked.remove(&e.name); }
+                                    preview.selected = preview.checked.iter().next().cloned();
+                                }
+                                let response = ui.selectable_label(checked, &e.name);
+                                if response.clicked() {
+                                    if ui.input(|i| i.modifiers.command || i.modifiers.ctrl) {
+                                        if !preview.checked.remove(&e.name) { preview.checked.insert(e.name.clone()); }
+                                    } else { preview.checked = BTreeSet::from([e.name.clone()]); }
+                                    preview.selected = preview.checked.iter().next().cloned();
+                                }
+                                if response.secondary_clicked() {
+                                    if !preview.checked.contains(&e.name) { preview.checked = BTreeSet::from([e.name.clone()]); }
+                                    preview.selected = Some(e.name.clone());
+                                }
                                 if response.double_clicked() && e.directory { directory = Some(inner_path(&preview.directory, &e.name)); }
                                 response.context_menu(|ui| {
-                                    if e.directory && menu_item(ui, "Open folder", true) { directory = Some(inner_path(&preview.directory, &e.name)); }
-                                    if !e.directory && menu_item(ui, "Export file…", true) { extract = true; }
-                                    if menu_item(ui, "Rename…", true) { action = Some("image-rename"); }
-                                    if menu_item(ui, "Remove…", true) { action = Some("image-remove"); }
+                                    if e.directory && menu_item(ui, "Open folder", preview.checked.len() == 1) { directory = Some(inner_path(&preview.directory, &e.name)); }
+                                    if !e.directory && menu_item(ui, "Export file…", preview.checked.len() == 1) { extract = true; }
+                                    if menu_item(ui, "Rename…", preview.checked.len() == 1) { action = Some("image-rename"); }
+                                    if menu_item(ui, "Remove selected…", true) { remove_batch = true; }
                                     ui.separator();
-                                    if menu_item(ui, "Add file here…", true) { action = Some("image-import"); }
+                                    if menu_item(ui, "Add files here…", true) { import_batch = Some(false); }
+                                    if menu_item(ui, "Add folders here…", true) { import_batch = Some(true); }
                                     if menu_item(ui, "New folder here…", true) { action = Some("image-mkdir"); }
                                 });
-                            });
+                            }); });
                             tr.col(|ui| { ui.label(if e.directory { "Folder" } else { "File" }); });
                             tr.col(|ui| { ui.label(format_size(e.size)); });
                         }));
                     if preview.entries.is_empty() { ui.label("This folder is empty. Add a file or create a folder to get started."); }
                 });
             });
+        if let Some(folders) = import_batch {
+            let preview = preview.clone();
+            self.worker(ctx, "Choose items to add…", move || {
+                let dialog = rfd::FileDialog::new();
+                let sources = if folders {
+                    dialog.pick_folders()
+                } else {
+                    dialog.pick_files()
+                };
+                let Some(sources) = sources else {
+                    return Ok(Event::Preview(preview));
+                };
+                let edits = plan_imports(&preview, &sources)?;
+                Ok(Event::Prepared(batch_form(&preview, edits, false)))
+            });
+        }
+        if remove_batch {
+            let preview = preview.clone();
+            self.worker(ctx, "Preparing selected items…", move || {
+                let edits = plan_removals(&preview)?;
+                Ok(Event::Prepared(batch_form(&preview, edits, true)))
+            });
+        }
         if let Some(dir) = directory {
             let image = preview.image.clone();
             let temp = preview.temp.clone();
@@ -2487,6 +2549,7 @@ impl App {
                     entries,
                     temp,
                     selected: None,
+                    checked: BTreeSet::new(),
                     title,
                 }))
             });
@@ -2684,6 +2747,191 @@ fn disk_menu(
     }
     action
 }
+#[derive(Clone)]
+enum DiskEdit {
+    Import(PathBuf, String),
+    Mkdir(String),
+    Remove(String),
+}
+impl DiskEdit {
+    fn description(&self) -> String {
+        match self {
+            Self::Import(source, name) => format!("Add {} → {name}", source.display()),
+            Self::Mkdir(name) => format!("Create folder {name}"),
+            Self::Remove(name) => format!("Remove {name}"),
+        }
+    }
+}
+
+fn batch_form(preview: &Preview, edits: Vec<DiskEdit>, removing: bool) -> Form {
+    let mut form = Form::operation(OPS.iter().find(|o| o.command == "image-remove").unwrap());
+    form.bind_editor(preview);
+    form.values[1] = "batch".into();
+    form.title = if removing {
+        "Remove selected items"
+    } else {
+        "Add files and folders"
+    }
+    .into();
+    form.description = format!(
+        "{} {}. {} Review the list, then save this batch directly to disk.",
+        edits.len(),
+        if removing {
+            "entries will be removed"
+        } else {
+            "entries will be added"
+        },
+        if removing {
+            "Selected folders include all their contents."
+        } else {
+            "DOS names are shown below; existing entries are preserved."
+        }
+    );
+    form.description.push_str(&format!(
+        " Target: {}{}",
+        preview.target.display(),
+        preview
+            .bank
+            .as_ref()
+            .map(|(_, n)| format!(" (bank {n:03})"))
+            .unwrap_or_default()
+    ));
+    form.batch = Some(edits);
+    form
+}
+
+fn unique_dos_name(source: &str, occupied: &mut BTreeSet<String>) -> String {
+    let suggested = suggest_dos_name(source);
+    if occupied.insert(suggested.clone()) {
+        return suggested;
+    }
+    let (base, extension) = suggested.rsplit_once('.').unwrap_or((&suggested, ""));
+    for n in 1.. {
+        let suffix = format!("~{n}");
+        let base = &base[..base.len().min(8usize.saturating_sub(suffix.len()))];
+        let name = format!(
+            "{base}{suffix}{}",
+            if extension.is_empty() {
+                String::new()
+            } else {
+                format!(".{extension}")
+            }
+        );
+        if occupied.insert(name.clone()) {
+            return name;
+        }
+    }
+    unreachable!()
+}
+
+fn plan_imports(preview: &Preview, sources: &[PathBuf]) -> Result<Vec<DiskEdit>, String> {
+    let plan = || -> crate::Result<Vec<DiskEdit>> {
+        let mut edits = vec![];
+        let mut pending = vec![(preview.directory.clone(), sources.to_vec(), true)];
+        while let Some((directory, mut sources, existing)) = pending.pop() {
+            sources.sort();
+            sources.dedup();
+            let mut occupied: BTreeSet<String> = if existing {
+                crate::fat12::directory_entries(&preview.image, &directory)?
+                    .into_iter()
+                    .map(|e| e.name.to_ascii_uppercase())
+                    .collect()
+            } else {
+                BTreeSet::new()
+            };
+            for source in sources {
+                let metadata = fs::symlink_metadata(&source)?;
+                if metadata.file_type().is_symlink() || !(metadata.is_file() || metadata.is_dir()) {
+                    return Err(format!(
+                        "Cannot import link or special file: {}",
+                        source.display()
+                    )
+                    .into());
+                }
+                let name = source
+                    .file_name()
+                    .ok_or("Missing source name")?
+                    .to_string_lossy();
+                let name = inner_path(&directory, &unique_dos_name(&name, &mut occupied));
+                if metadata.is_dir() {
+                    edits.push(DiskEdit::Mkdir(name.clone()));
+                    let children = fs::read_dir(&source)?
+                        .map(|e| e.map(|e| e.path()))
+                        .collect::<std::io::Result<Vec<_>>>()?;
+                    pending.push((name, children, false));
+                } else {
+                    edits.push(DiskEdit::Import(source, name));
+                }
+            }
+        }
+        Ok(edits)
+    };
+    plan().map_err(|e| e.to_string())
+}
+
+fn plan_removals(preview: &Preview) -> Result<Vec<DiskEdit>, String> {
+    let plan = || -> crate::Result<Vec<DiskEdit>> {
+        crate::fat12::check(&preview.image)?;
+        let mut edits = vec![];
+        let mut pending = vec![];
+        for name in &preview.checked {
+            let entry = preview
+                .entries
+                .iter()
+                .find(|e| &e.name == name)
+                .ok_or("Selected entry no longer exists")?;
+            pending.push((inner_path(&preview.directory, name), entry.directory, false));
+        }
+        while let Some((path, directory, visited)) = pending.pop() {
+            if directory && !visited {
+                pending.push((path.clone(), true, true));
+                for entry in crate::fat12::directory_entries(&preview.image, &path)? {
+                    pending.push((inner_path(&path, &entry.name), entry.directory, false));
+                }
+            } else {
+                edits.push(DiskEdit::Remove(path));
+            }
+        }
+        Ok(edits)
+    };
+    plan().map_err(|e| e.to_string())
+}
+
+fn stage_batch(input: &Path, edits: &[DiskEdit], temp: &Path, output: &Path) -> crate::Result<()> {
+    if edits.is_empty() {
+        return Err("Select at least one item".into());
+    }
+    let mut current = input.to_path_buf();
+    for (index, edit) in edits.iter().enumerate() {
+        let next = if index + 1 == edits.len() {
+            output.to_path_buf()
+        } else {
+            temp.join(format!("step{index}.img"))
+        };
+        let result = match edit {
+            DiskEdit::Import(source, name) => {
+                if !fs::symlink_metadata(source)?.is_file() {
+                    return Err("Import source changed or is not a regular file".into());
+                }
+                crate::fat12::import(&current, source, name, &next)
+            }
+            DiskEdit::Mkdir(name) => crate::fat12::mkdir(&current, name, &next),
+            DiskEdit::Remove(name) => crate::fat12::remove(&current, name, &next),
+        };
+        result.map_err(|e| {
+            format!(
+                "{}: {e}. Batch not saved; disk unchanged.",
+                edit.description()
+            )
+        })?;
+        if current != input {
+            fs::remove_file(&current)?;
+        }
+        current = next;
+    }
+    Ok(())
+}
+
 fn is_disk_edit(command: &str) -> bool {
     matches!(
         command,
@@ -2711,6 +2959,7 @@ fn open_editor(row: &DiskRow, profile: &str) -> Result<Preview, String> {
         temp: Some(temp),
         directory: "/".into(),
         selected: None,
+        checked: BTreeSet::new(),
         title: row.name.clone(),
     })
 }
@@ -2724,13 +2973,17 @@ fn save_editor(form: &Form) -> Result<Preview, String> {
         let image = temp.path().join("disk.img");
         let input = &preview.image;
         let v = &form.values;
-        match form.command.as_str() {
-            "image-import" => crate::fat12::import(input, Path::new(&v[1]), &v[2], &image)?,
-            "image-mkdir" => crate::fat12::mkdir(input, &v[1], &image)?,
-            "image-remove" => crate::fat12::remove(input, &v[1], &image)?,
-            "image-rename" => crate::fat12::rename(input, &v[1], &v[2], &image)?,
-            "image-label" => crate::fat12::set_label(input, &v[1], &image)?,
-            _ => return Err("Unsupported disk edit".into()),
+        if let Some(edits) = &form.batch {
+            stage_batch(input, edits, temp.path(), &image)?;
+        } else {
+            match form.command.as_str() {
+                "image-import" => crate::fat12::import(input, Path::new(&v[1]), &v[2], &image)?,
+                "image-mkdir" => crate::fat12::mkdir(input, &v[1], &image)?,
+                "image-remove" => crate::fat12::remove(input, &v[1], &image)?,
+                "image-rename" => crate::fat12::rename(input, &v[1], &v[2], &image)?,
+                "image-label" => crate::fat12::set_label(input, &v[1], &image)?,
+                _ => return Err("Unsupported disk edit".into()),
+            }
         }
         let entries = crate::fat12::directory_entries(&image, &preview.directory)?;
         let label = crate::fat12::volume_label(&image)?;
@@ -2746,6 +2999,7 @@ fn save_editor(form: &Form) -> Result<Preview, String> {
             entries,
             label,
             selected: None,
+            checked: BTreeSet::new(),
             ..preview.clone()
         })
     };
@@ -3111,17 +3365,19 @@ mod tests {
             entries: crate::fat12::directory_entries(&image, "/").unwrap(),
             temp: None,
             selected: Some("SAMPLES".into()),
+            checked: BTreeSet::from(["SAMPLES".into()]),
             title: "disk.img".into(),
         });
         render(&mut app, &ctx, vec![]);
         let output = render(&mut app, &ctx, vec![]);
         for label in [
             "Change label",
-            "Add file",
+            "Add files",
+            "Add folders",
             "New folder",
             "Open folder",
             "Rename",
-            "Remove",
+            "Remove selected",
         ] {
             assert!(
                 text_position(&output.shapes, label).is_some(),
@@ -3329,6 +3585,112 @@ mod tests {
                 .contains("Disk changed")
         );
         assert_eq!(fs::read(&disk).unwrap(), changed);
+    }
+
+    #[test]
+    fn batch_imports_multiple_files_and_folder_trees_then_removes_them() {
+        let temp = tempfile::tempdir().unwrap();
+        let disk = temp.path().join("disk.img");
+        crate::fat12::create(&disk, 1440).unwrap();
+        let sources = temp.path().join("sources");
+        fs::create_dir_all(sources.join("Sounds/Nested/Empty")).unwrap();
+        fs::create_dir_all(sources.join("Other")).unwrap();
+        fs::write(sources.join("Sounds/Nested/tone.wav"), b"sound").unwrap();
+        fs::write(sources.join("a very long name.txt"), b"one").unwrap();
+        fs::write(sources.join("a very long note.txt"), b"two").unwrap();
+        let preview = open_editor(&editor_row(&disk, None), "gotek1440").unwrap();
+        let paths = fs::read_dir(&sources)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect::<Vec<_>>();
+        let edits = plan_imports(&preview, &paths).unwrap();
+        let mut preview = save_editor(&batch_form(&preview, edits, false)).unwrap();
+        let names: BTreeSet<_> = preview.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(
+            names,
+            BTreeSet::from(["AVERYLON.TXT", "AVERYL~1.TXT", "SOUNDS", "OTHER"])
+        );
+        assert!(
+            crate::fat12::directory_entries(&disk, "SOUNDS/NESTED")
+                .unwrap()
+                .iter()
+                .any(|e| e.name == "EMPTY" && e.directory)
+        );
+        let extracted = temp.path().join("tone.wav");
+        crate::fat12::extract(&disk, "SOUNDS/NESTED/TONE.WAV", &extracted).unwrap();
+        assert_eq!(fs::read(extracted).unwrap(), b"sound");
+        preview.checked = preview.entries.iter().map(|e| e.name.clone()).collect();
+        let edits = plan_removals(&preview).unwrap();
+        assert_eq!(edits.len(), 7);
+        let preview = save_editor(&batch_form(&preview, edits, true)).unwrap();
+        assert!(preview.entries.is_empty());
+        crate::fat12::check(&disk).unwrap();
+    }
+
+    #[test]
+    fn failed_batches_leave_disk_unchanged_and_imports_preserve_existing_names() {
+        let temp = tempfile::tempdir().unwrap();
+        let disk = temp.path().join("disk.img");
+        crate::fat12::create(&disk, 360).unwrap();
+        let file = temp.path().join("note.txt");
+        fs::write(&file, b"keep").unwrap();
+        let preview = open_editor(&editor_row(&disk, None), "gotek1440").unwrap();
+        let edits = plan_imports(&preview, std::slice::from_ref(&file)).unwrap();
+        let preview = save_editor(&batch_form(&preview, edits, false)).unwrap();
+        let edits = plan_imports(&preview, std::slice::from_ref(&file)).unwrap();
+        assert!(matches!(&edits[0], DiskEdit::Import(_, name) if name == "NOTE~1.TXT"));
+        let original = fs::read(&disk).unwrap();
+        let huge = temp.path().join("huge.bin");
+        fs::write(&huge, vec![1; 400 * 1024]).unwrap();
+        let edits = vec![
+            DiskEdit::Mkdir("NEW".into()),
+            DiskEdit::Import(huge, "NEW/HUGE.BIN".into()),
+        ];
+        assert!(save_editor(&batch_form(&preview, edits, false)).is_err());
+        assert_eq!(fs::read(&disk).unwrap(), original);
+        let edits = vec![
+            DiskEdit::Remove("NOTE.TXT".into()),
+            DiskEdit::Remove("MISSING".into()),
+        ];
+        assert!(save_editor(&batch_form(&preview, edits, true)).is_err());
+        assert_eq!(fs::read(&disk).unwrap(), original);
+    }
+
+    #[test]
+    fn bank_batches_commit_only_the_selected_payload() {
+        let temp = tempfile::tempdir().unwrap();
+        let disk = temp.path().join("banks.bin");
+        crate::banks::create_layout(&disk, "gotek720", 3, "minimum").unwrap();
+        let original = fs::read(&disk).unwrap();
+        let preview = open_editor(&editor_row(&disk, Some(1)), "gotek720").unwrap();
+        let edits = vec![DiskEdit::Mkdir("ONE".into()), DiskEdit::Mkdir("TWO".into())];
+        let preview = save_editor(&batch_form(&preview, edits, false)).unwrap();
+        assert_eq!(preview.entries.len(), 2);
+        let updated = fs::read(&disk).unwrap();
+        assert_eq!(&updated[..0x100000], &original[..0x100000]);
+        assert_eq!(
+            &updated[0x100000 + 720 * 1024..],
+            &original[0x100000 + 720 * 1024..]
+        );
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn folder_import_refuses_symbolic_links() {
+        let temp = tempfile::tempdir().unwrap();
+        let disk = temp.path().join("disk.img");
+        crate::fat12::create(&disk, 720).unwrap();
+        let folder = temp.path().join("folder");
+        fs::create_dir(&folder).unwrap();
+        std::os::unix::fs::symlink(&folder, folder.join("loop")).unwrap();
+        let preview = open_editor(&editor_row(&disk, None), "gotek720").unwrap();
+        assert!(
+            plan_imports(&preview, &[folder])
+                .err()
+                .unwrap()
+                .contains("link")
+        );
     }
 
     #[test]

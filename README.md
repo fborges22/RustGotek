@@ -40,11 +40,16 @@ for changes. If the desktop reports no preference, System uses the light theme.
   the selection. Double-click a folder to navigate or a FAT12 disk to browse it.
 - **Create disk:** choose a destination and floppy capacity to make a formatted
   FAT12 data disk. The new disk opens immediately for adding files.
-- **Disk contents:** use **Change label** to name a disk, **Add file** and
-  **New folder** to populate it, and **Rename**, **Remove**, or **Export file**
+- **Disk contents:** use **Change label** to name a disk, **Add files**, **Add folders**, and
+  **New folder** to populate it, and **Rename**, **Remove selected**, or **Export file**
   for the selected entry. Select a folder and click **Open folder**, double-click
-  it, or use the clickable folder path to navigate. Remove accepts files and
-  empty folders. **Save changes** updates the opened image or selected USB bank
+  it, or use the clickable folder path to navigate. Check multiple entries or
+  use **Select all** to remove files and folders together; selected folders
+  include all their contents. File and folder pickers accept multiple selections,
+  and folder imports include nested and empty folders. Review the batch and its
+  DOS names before saving. Name collisions receive unique DOS aliases. Batches
+  are staged completely before writing, so invalid entries or insufficient space
+  leave the disk unchanged. **Save changes** updates the opened image or selected USB bank
   directly and keeps your current folder open. There is no destination-image
   dialog, persistent backup, or separate apply step. Use **Export** first if you
   want a backup. Saves detect changes made since the disk was opened and verify
