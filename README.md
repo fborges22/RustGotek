@@ -40,9 +40,18 @@ for changes. If the desktop reports no preference, System uses the light theme.
   the selection. Double-click a folder to navigate or a FAT12 disk to browse it.
 - **Create disk:** choose a destination and floppy capacity to make a formatted
   FAT12 data disk. The new disk opens immediately for adding files.
-- **Disk contents:** browse directories, export files, add files, create folders,
-  rename and remove entries. Edits save a new image and open that copy so you can
-  continue editing. Files inside FAT12 disks use DOS 8.3 names.
+- **Disk contents:** use **Change label** to name a disk, **Add file** and
+  **New folder** to populate it, and **Rename**, **Remove**, or **Export file**
+  for the selected entry. Select a folder and click **Open folder**, double-click
+  it, or use the clickable folder path to navigate. Remove accepts files and
+  empty folders. **Save changes** updates the opened image or selected USB bank
+  directly and keeps your current folder open. There is no destination-image
+  dialog, persistent backup, or separate apply step. Use **Export** first if you
+  want a backup. Saves detect changes made since the disk was opened and verify
+  the written bytes. USB writes require an unmounted device and request system
+  authorization when needed. Imports suggest DOS 8.3 names;
+  invalid names are explained before saving. Failed edits retain the form for
+  correction. Disk labels support up to 11 ASCII characters including spaces.
 - **Gotek USB banks:** enter a raw device such as `/dev/sda` or choose a whole-device
   backup, select the bank profile, and click **Scan banks**. Select banks to export
   them individually or in batches. **Replace → Replace bank with recovery** takes a replacement image and
@@ -59,7 +68,8 @@ for changes. If the desktop reports no preference, System uses the light theme.
 
 Operations run on background threads. Results appear in the activity log with a
 copy button, and file/folder inputs have native pickers. Existing output files
-are never overwritten. Media changes such as bank replacement, full-device
+are never overwritten by export and copy operations. Disk-editor saves update
+existing disks directly. Media changes such as explicit bank replacement, full-device
 restore and moving an image to trash require a review and confirmation.
 
 On Linux, read-only mounts disable media write actions. The image library takes
@@ -67,6 +77,11 @@ a directory; the bank workspace takes a raw device or whole-device image.
 A tiny FAT volume on a larger USB device exposes only one bank through the normal
 file browser. Folder backups do not capture other banks or boot sectors; use
 **Gotek USB banks → Backup → Create backup** for those.
+
+Direct editor saves use temporary staging that is cleaned up automatically.
+Detected write failures attempt to restore the original contents from memory;
+power loss or device removal can interrupt a save. The CLI image-edit commands
+below still use explicit output paths to create copies.
 
 The GUI uses egui/eframe 0.33 with OpenGL rendering and native dialogs through
 rfd. Linux requires a desktop session; native dialogs use its XDG portal service.
@@ -99,7 +114,11 @@ and disk-row context menus.
 Open it with a source prefilled using `cargo run -- gui banks /dev/sda`.
 Linux raw reads
 use UDisks and the desktop authentication dialog if ordinary read permission is
-missing. Read operations request a read-only device handle. The explicit bank-write
+missing. GUI device operations share a persistent system-bus connection so
+polkit can reuse authentication instead of treating each operation as a new
+caller. Authorization is requested only when ordinary access is denied;
+expiration, a different authorization policy, or an OS session change can
+require another prompt. Read operations request a read-only device handle. The explicit bank-write
 and device-restore operations request exclusive read/write access. The GUI does not run as root
 or alter device permissions. Other systems can work with whole-device
 image files; raw Windows device paths are not supported yet.
@@ -325,6 +344,7 @@ rustgotek create-fat12 dos-disk.img 1440
 rustgotek inspect-fat12 dos-disk.img
 rustgotek image-check dos-disk.img
 rustgotek image-list dos-disk.img
+rustgotek image-label dos-disk.img "MY SAMPLES" labelled-disk.img
 rustgotek image-list dos-disk.img DOCUMENT
 rustgotek image-extract dos-disk.img DOCUMENT/NOTES.TXT ./notes.txt
 rustgotek image-import dos-disk.img ./notes.txt NOTES.TXT updated-disk.img

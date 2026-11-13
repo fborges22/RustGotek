@@ -260,7 +260,7 @@ static OPS: &[Operation] = &[
         false,
         false,
         [
-            field!("New image", Save, ""),
+            field!("Save edited copy as", Save, ""),
             field!("Capacity in KiB: 360, 720, 1200, 1440, 2880", Text, "1440")
         ]
     ),
@@ -323,6 +323,20 @@ static OPS: &[Operation] = &[
     ),
     op!(
         Images,
+        "Change disk label",
+        "image-label",
+        "Give this disk a recognizable DOS label (up to 11 characters). The original image is preserved.",
+        false,
+        false,
+        false,
+        [
+            field!("Original image", File, ""),
+            field!("Disk label", Text, ""),
+            field!("Save edited copy as", Save, "")
+        ]
+    ),
+    op!(
+        Images,
         "Add a file",
         "image-import",
         "Save an edited copy of a FAT12 image; the original is preserved.",
@@ -333,12 +347,12 @@ static OPS: &[Operation] = &[
             field!("Original image", File, ""),
             field!("File to add", File, ""),
             field!("DOS 8.3 path inside image", Text, ""),
-            field!("New image", Save, "")
+            field!("Save edited copy as", Save, "")
         ]
     ),
     op!(
         Images,
-        "Create an image directory",
+        "New folder",
         "image-mkdir",
         "Create a directory in a new copy of the FAT12 image.",
         false,
@@ -347,12 +361,12 @@ static OPS: &[Operation] = &[
         [
             field!("Original image", File, ""),
             field!("DOS 8.3 directory path", Text, ""),
-            field!("New image", Save, "")
+            field!("Save edited copy as", Save, "")
         ]
     ),
     op!(
         Images,
-        "Remove an image entry",
+        "Remove file or folder",
         "image-remove",
         "Remove a file or empty directory in a new copy. Original is preserved.",
         false,
@@ -361,12 +375,12 @@ static OPS: &[Operation] = &[
         [
             field!("Original image", File, ""),
             field!("Path inside image", Text, ""),
-            field!("New image", Save, "")
+            field!("Save edited copy as", Save, "")
         ]
     ),
     op!(
         Images,
-        "Rename an image entry",
+        "Rename file or folder",
         "image-rename",
         "Rename a file or directory within its parent in a new copy.",
         false,
@@ -376,7 +390,7 @@ static OPS: &[Operation] = &[
             field!("Original image", File, ""),
             field!("Path inside image", Text, ""),
             field!("New DOS 8.3 name", Text, ""),
-            field!("New image", Save, "")
+            field!("Save edited copy as", Save, "")
         ]
     ),
     op!(
@@ -539,14 +553,19 @@ enum Sort {
     Kind,
     Size,
 }
+#[derive(Clone)]
 struct Preview {
+    target: PathBuf,
+    bank: Option<(String, u16)>,
     image: PathBuf,
     directory: String,
     entries: Vec<crate::fat12::DiskEntry>,
     temp: Option<Arc<tempfile::TempDir>>,
     selected: Option<String>,
     title: String,
+    label: String,
 }
+#[derive(Clone)]
 struct Form {
     title: String,
     description: String,
@@ -559,6 +578,7 @@ struct Form {
     confirm: bool,
     review: bool,
     keepalive: Option<Arc<tempfile::TempDir>>,
+    editor: Option<Preview>,
 }
 impl Form {
     fn operation(op: &Operation) -> Self {
@@ -574,7 +594,23 @@ impl Form {
             confirm: op.confirm,
             review: false,
             keepalive: None,
+            editor: None,
         }
+    }
+    fn bind_editor(&mut self, preview: &Preview) {
+        self.values[0] = preview.image.to_string_lossy().into_owned();
+        *self.values.last_mut().unwrap() = "direct-save".into();
+        self.description = format!(
+            "Save changes directly to {}{}. No backup image is created.",
+            preview.target.display(),
+            preview
+                .bank
+                .as_ref()
+                .map(|(_, n)| format!(" • bank {n:03}"))
+                .unwrap_or_default()
+        );
+        self.keepalive = preview.temp.clone();
+        self.editor = Some(preview.clone());
     }
     fn args(&self, root: &str) -> Result<Vec<String>, String> {
         if self.media && root.is_empty() {
@@ -583,6 +619,20 @@ impl Form {
         if self.values.len() != self.labels.len() || self.values.iter().any(|s| s.trim().is_empty())
         {
             return Err("Complete all fields before continuing".into());
+        }
+        match self.command.as_str() {
+            "image-label" => {
+                crate::fat12::encode_label(&self.values[1]).map_err(|e| e.to_string())?;
+            }
+            "image-import" | "image-mkdir" | "image-rename" => {
+                let index = if self.command == "image-mkdir" { 1 } else { 2 };
+                let name = self.values[index].rsplit('/').next().unwrap_or("");
+                if self.command == "image-rename" && self.values[index].contains('/') {
+                    return Err("Enter a name, without a directory path".into());
+                }
+                crate::fat12::validate_short_name(name).map_err(|_| "Use a DOS name: up to 8 characters plus a 3-character extension, for example NOTES.TXT".to_string())?;
+            }
+            _ => {}
         }
         let mut args = vec![self.command.clone()];
         if self.media {
@@ -600,6 +650,7 @@ enum Event {
     Banks(crate::banks::Catalog, String, String),
     Preview(Preview),
     Prepared(Form),
+    FormFailed(Form, String),
     Done(String),
     Edited(Preview, String),
     Picked(usize, Option<PathBuf>),
@@ -714,6 +765,14 @@ impl App {
                     self.log = error;
                     self.show_log = true;
                 }
+                Ok(Event::FormFailed(mut form, error)) => {
+                    form.review = false;
+                    self.form = Some(form);
+                    self.error = true;
+                    self.status = "Operation failed — correct the fields and try again".into();
+                    self.log = error;
+                    self.show_log = true;
+                }
                 Ok(Event::Listed(listing)) => {
                     self.root = listing.root.to_string_lossy().into_owned();
                     self.rows = listing
@@ -780,7 +839,7 @@ impl App {
                 Ok(Event::Edited(preview, output)) => {
                     self.preview = Some(preview);
                     self.log = output;
-                    self.status = "Saved and opened the new image".into();
+                    self.status = "Disk saved".into();
                     self.show_log = true;
                     self.refresh(ctx);
                 }
@@ -797,7 +856,7 @@ impl App {
                             && (form.values[2].is_empty() || form.values[2].ends_with('/'))
                             && let Some(name) = path.file_name()
                         {
-                            form.values[2].push_str(&name.to_string_lossy().to_ascii_uppercase());
+                            form.values[2].push_str(&suggest_dos_name(&name.to_string_lossy()));
                         }
                         form.values[i] = path.to_string_lossy().into_owned();
                         form.review = false;
@@ -906,6 +965,7 @@ impl App {
     }
     fn open_form(&mut self, command: &str) {
         if let Some(op) = OPS.iter().find(|o| o.command == command) {
+            self.error = false;
             let mut form = Form::operation(op);
             let selected = self.selection();
             if command == "device-restore" {
@@ -973,11 +1033,7 @@ impl App {
         }
         let profile = self.profile.clone();
         self.worker(ctx, "Opening disk contents…", move || {
-            let (image, temp) = disk_snapshot(&row, &profile)?;
-            let entries = crate::fat12::directory_entries(&image, "/").map_err(|e| {
-                format!("Cannot browse this disk as FAT12: {e}. Use the Check or Convert toolbar menus for image inspection and conversion.")
-            })?;
-            Ok(Event::Preview(Preview { image, directory: "/".into(), entries, temp, selected: None, title: row.name }))
+            open_editor(&row, &profile).map(Event::Preview)
         });
     }
     fn export_selected(&mut self, ctx: &egui::Context) {
@@ -1065,6 +1121,7 @@ impl App {
             confirm: true,
             review: false,
             keepalive: None,
+            editor: None,
         });
     }
     fn execute_form(&mut self, ctx: &egui::Context) {
@@ -1084,64 +1141,94 @@ impl App {
                 return;
             }
         };
+        if form.editor.is_some() {
+            self.worker(
+                ctx,
+                "Saving changes to disk…",
+                move || match save_editor(&form) {
+                    Ok(preview) => Ok(Event::Edited(
+                        preview,
+                        "Changes saved directly to disk and verified".into(),
+                    )),
+                    Err(error) => Ok(Event::FormFailed(form, error)),
+                },
+            );
+            return;
+        }
         let edited = match form.command.as_str() {
-            "image-import" | "image-mkdir" | "image-remove" | "image-rename" => {
+            "image-import" | "image-mkdir" | "image-remove" | "image-rename" | "image-label" => {
                 form.values.last().map(PathBuf::from)
             }
             "create-fat12" => Some(PathBuf::from(&form.values[0])),
             _ => None,
         };
+        let directory = self
+            .preview
+            .as_ref()
+            .filter(|p| form.values.first().is_some_and(|v| Path::new(v) == p.image))
+            .map(|p| p.directory.clone())
+            .unwrap_or_else(|| "/".into());
+        let retry_form = form.clone();
         let keepalive = form.keepalive;
         self.worker(ctx, &format!("{}…", form.title), move || {
             let _keepalive = keepalive;
-            let output = if args[0] == "gui-replace-bank" {
-                let temp = tempfile::tempdir().map_err(|e| e.to_string())?;
-                let expected = temp
-                    .path()
-                    .join("original.img")
-                    .to_string_lossy()
-                    .into_owned();
-                backend(vec![
-                    "bank-export".into(),
-                    args[1].clone(),
-                    args[2].clone(),
-                    args[3].clone(),
-                    expected.clone(),
-                ])?;
-                backend(vec![
-                    "bank-write".into(),
-                    args[1].clone(),
-                    args[2].clone(),
-                    args[3].clone(),
-                    args[4].clone(),
-                    expected,
-                    args[5].clone(),
-                    "--confirm-write".into(),
-                ])?
-            } else {
-                backend(args)?
-            };
-            if let Some(image) = edited {
-                let entries = crate::fat12::directory_entries(&image, "/")
-                    .map_err(|e| format!("Image saved, but could not open it: {e}"))?;
-                let title = image
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .into_owned();
-                return Ok(Event::Edited(
-                    Preview {
-                        image,
-                        directory: "/".into(),
-                        entries,
-                        temp: None,
-                        selected: None,
-                        title,
-                    },
-                    output,
-                ));
+            let result = (|| {
+                let output = if args[0] == "gui-replace-bank" {
+                    let temp = tempfile::tempdir().map_err(|e| e.to_string())?;
+                    let expected = temp
+                        .path()
+                        .join("original.img")
+                        .to_string_lossy()
+                        .into_owned();
+                    backend(vec![
+                        "bank-export".into(),
+                        args[1].clone(),
+                        args[2].clone(),
+                        args[3].clone(),
+                        expected.clone(),
+                    ])?;
+                    backend(vec![
+                        "bank-write".into(),
+                        args[1].clone(),
+                        args[2].clone(),
+                        args[3].clone(),
+                        args[4].clone(),
+                        expected,
+                        args[5].clone(),
+                        "--confirm-write".into(),
+                    ])?
+                } else {
+                    backend(args)?
+                };
+                if let Some(image) = edited {
+                    let title = image
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned();
+                    let row = DiskRow {
+                        key: image.to_string_lossy().into_owned(),
+                        name: title,
+                        kind: "FAT12".into(),
+                        size: 0,
+                        path: image,
+                        bank: None,
+                        directory: false,
+                        recognized: true,
+                    };
+                    let mut preview = open_editor(&row, "gotek1440")
+                        .map_err(|e| format!("Disk saved, but could not open it: {e}"))?;
+                    preview.entries = crate::fat12::directory_entries(&preview.image, &directory)
+                        .map_err(|e| e.to_string())?;
+                    preview.directory = directory;
+                    return Ok(Event::Edited(preview, output));
+                }
+                Ok(Event::Done(output))
+            })();
+            match result {
+                Ok(event) => Ok(event),
+                Err(error) => Ok(Event::FormFailed(retry_form, error)),
             }
-            Ok(Event::Done(output))
         });
     }
 }
@@ -1841,6 +1928,7 @@ impl App {
             confirm: true,
             review: false,
             keepalive: None,
+            editor: None,
         });
     }
     fn disk_command(&mut self, ctx: &egui::Context, command: &'static str) {
@@ -1855,16 +1943,24 @@ impl App {
         let row = row.clone();
         let profile = self.profile.clone();
         self.worker(ctx, "Preparing selected disk…", move || {
-            let (image, temp) = disk_snapshot(&row, &profile)?;
-            if matches!(command, "image-check" | "inspect-fat12" | "inspect-hfe") {
-                return backend(vec![command.into(), image.to_string_lossy().into_owned()])
-                    .map(Event::Done);
-            }
             let op = OPS
                 .iter()
                 .find(|o| o.command == command)
                 .ok_or("Unknown disk action")?;
             let mut form = Form::operation(op);
+            if is_disk_edit(command) {
+                let preview = open_editor(&row, &profile)?;
+                form.bind_editor(&preview);
+                if command == "image-label" {
+                    form.values[1] = preview.label.clone();
+                }
+                return Ok(Event::Prepared(form));
+            }
+            let (image, temp) = disk_snapshot(&row, &profile)?;
+            if matches!(command, "image-check" | "inspect-fat12" | "inspect-hfe") {
+                return backend(vec![command.into(), image.to_string_lossy().into_owned()])
+                    .map(Event::Done);
+            }
             form.values[0] = image.to_string_lossy().into_owned();
             form.keepalive = temp;
             if command == "convert-hfe" {
@@ -2129,6 +2225,9 @@ impl App {
             .show(ctx, |ui| {
                 ui.add_enabled_ui(!self.busy, |ui| {
                     ui.label(&form.description);
+                    if self.error {
+                        ui.colored_label(visual::colors(ui.ctx()).red, &self.log);
+                    }
                     if form.media {
                         ui.label(format!("Media: {}", self.root));
                     }
@@ -2166,7 +2265,22 @@ impl App {
                             .max_height(440.0)
                             .show(ui, |ui| {
                                 for i in 0..form.values.len() {
+                                    if form.editor.is_some()
+                                        && (i == 0 || i == form.values.len() - 1)
+                                    {
+                                        continue;
+                                    }
                                     ui.label(&form.labels[i]);
+                                    if i == 0
+                                        && form.command.starts_with("image-")
+                                        && self
+                                            .preview
+                                            .as_ref()
+                                            .is_some_and(|p| Path::new(&form.values[0]) == p.image)
+                                    {
+                                        ui.label(RichText::new(&form.values[i]).weak());
+                                        continue;
+                                    }
                                     ui.horizontal(|ui| {
                                         if form.labels[i].to_lowercase().contains("profile")
                                             && (form.values[i].starts_with("gotek")
@@ -2212,19 +2326,29 @@ impl App {
                                     });
                                 }
                             });
-                        let readonly =
-                            form.writes_media && self.listing.as_ref().is_some_and(|l| l.read_only);
+                        let readonly = (form.writes_media
+                            && self.listing.as_ref().is_some_and(|l| l.read_only))
+                            || form
+                                .editor
+                                .as_ref()
+                                .is_some_and(|p| p.bank.is_none() && mount_read_only(&p.target));
                         if readonly {
                             ui.colored_label(
                                 visual::colors(ui.ctx()).amber,
                                 "This media is read-only.",
                             );
                         }
-                        let valid = form.args(&self.root).is_ok() && !readonly;
+                        let validation = form.args(&self.root);
+                        if let Err(message) = &validation {
+                            ui.colored_label(visual::colors(ui.ctx()).amber, message);
+                        }
+                        let valid = validation.is_ok() && !readonly;
                         if ui
                             .add_enabled(
                                 valid,
-                                egui::Button::new(if form.confirm {
+                                egui::Button::new(if form.editor.is_some() {
+                                    "Save changes"
+                                } else if form.confirm {
                                     "Review changes…"
                                 } else if form.command == "create-fat12" {
                                     "Create disk"
@@ -2234,8 +2358,9 @@ impl App {
                                         | "image-mkdir"
                                         | "image-remove"
                                         | "image-rename"
+                                        | "image-label"
                                 ) {
-                                    "Save new image"
+                                    "Save edited copy"
                                 } else {
                                     "Run operation"
                                 }),
@@ -2284,24 +2409,38 @@ impl App {
             .id(egui::Id::new("preview")).open(&mut open).default_size([720.0, 510.0])
             .show(ctx, |ui| {
                 ui.add_enabled_ui(!self.busy && self.form.is_none(), |ui| {
-                    if preview.temp.is_none() { ui.label(preview.image.display().to_string()); }
-                    if preview.temp.is_some() {
-                        ui.label(RichText::new("Bank snapshot: save edits to an image, then use Replace disk to write it back.").small().weak());
-                    }
+                    ui.label(preview.target.display().to_string());
+                    if let Some((_, bank)) = &preview.bank { ui.strong(format!("Editing bank {bank:03}")); }
+                    ui.horizontal_wrapped(|ui| {
+                        ui.heading(if preview.label.is_empty() { "Unlabelled disk" } else { &preview.label });
+                        if visual::small_button(ui, Icon::Edit, "Change label").clicked() { action = Some("image-label"); }
+                    });
+                    ui.label(RichText::new("Changes save directly to this disk. Use Export first if you want a backup.").small().weak());
                     ui.horizontal_wrapped(|ui| {
                         if ui.add_enabled_ui(preview.directory != "/", |ui| visual::small_button(ui, Icon::Up, "Up")).inner.clicked() {
                             directory = Some(parent_directory(&preview.directory));
                         }
-                        ui.strong(&preview.directory);
+                        if ui.small_button("Disk root").clicked() { directory = Some("/".into()); }
+                        let mut path = String::new();
+                        for part in preview.directory.split('/').filter(|p| !p.is_empty()) {
+                            path = inner_path(&path, part);
+                            ui.label("/");
+                            if ui.small_button(part).clicked() { directory = Some(path.clone()); }
+                        }
+                    });
+                    ui.horizontal_wrapped(|ui| {
                         if visual::small_button(ui, Icon::Check, "Check disk").clicked() { action = Some("image-check"); }
                         if visual::small_button(ui, Icon::Import, "Add file").clicked() { action = Some("image-import"); }
                         if visual::small_button(ui, Icon::Folder, "New folder").clicked() { action = Some("image-mkdir"); }
                     });
                     ui.horizontal_wrapped(|ui| {
                         let selected = preview.selected.as_ref().and_then(|s| preview.entries.iter().find(|e| &e.name == s));
+                        if ui.add_enabled_ui(selected.is_some_and(|e| e.directory), |ui| visual::small_button(ui, Icon::Folder, "Open folder")).inner.clicked() {
+                            directory = selected.map(|e| inner_path(&preview.directory, &e.name));
+                        }
                         if ui.add_enabled_ui(selected.is_some_and(|e| !e.directory), |ui| visual::small_button(ui, Icon::Export, "Export file")).inner.clicked() { extract = true; }
                         if ui.add_enabled_ui(selected.is_some(), |ui| visual::small_button(ui, Icon::Edit, "Rename")).inner.clicked() { action = Some("image-rename"); }
-                        if ui.add_enabled_ui(selected.is_some(), |ui| visual::small_button(ui, Icon::Trash, "Remove from copy")).inner.clicked() { action = Some("image-remove"); }
+                        if ui.add_enabled_ui(selected.is_some(), |ui| visual::small_button(ui, Icon::Trash, "Remove")).inner.clicked() { action = Some("image-remove"); }
                     });
                     ui.separator();
                     TableBuilder::new(ui).id_salt("contents-table").striped(true)
@@ -2318,7 +2457,7 @@ impl App {
                                     if e.directory && menu_item(ui, "Open folder", true) { directory = Some(inner_path(&preview.directory, &e.name)); }
                                     if !e.directory && menu_item(ui, "Export file…", true) { extract = true; }
                                     if menu_item(ui, "Rename…", true) { action = Some("image-rename"); }
-                                    if menu_item(ui, "Remove from copy…", true) { action = Some("image-remove"); }
+                                    if menu_item(ui, "Remove…", true) { action = Some("image-remove"); }
                                     ui.separator();
                                     if menu_item(ui, "Add file here…", true) { action = Some("image-import"); }
                                     if menu_item(ui, "New folder here…", true) { action = Some("image-mkdir"); }
@@ -2327,17 +2466,22 @@ impl App {
                             tr.col(|ui| { ui.label(if e.directory { "Folder" } else { "File" }); });
                             tr.col(|ui| { ui.label(format_size(e.size)); });
                         }));
-                    if preview.entries.is_empty() { ui.label("This directory is empty. Add a file to a new copy to get started."); }
+                    if preview.entries.is_empty() { ui.label("This folder is empty. Add a file or create a folder to get started."); }
                 });
             });
         if let Some(dir) = directory {
             let image = preview.image.clone();
             let temp = preview.temp.clone();
             let title = preview.title.clone();
+            let target = preview.target.clone();
+            let bank = preview.bank.clone();
             self.worker(ctx, "Reading disk directory…", move || {
                 let entries =
                     crate::fat12::directory_entries(&image, &dir).map_err(|e| e.to_string())?;
                 Ok(Event::Preview(Preview {
+                    target,
+                    bank,
+                    label: crate::fat12::volume_label(&image).map_err(|e| e.to_string())?,
                     image,
                     directory: dir,
                     entries,
@@ -2352,6 +2496,13 @@ impl App {
             if let Some(form) = &mut self.form {
                 form.values[0] = preview.image.to_string_lossy().into_owned();
                 form.keepalive = preview.temp.clone();
+                if command == "image-label" {
+                    form.values[1] = preview.label.clone();
+                }
+                if command == "image-rename" {
+                    form.values[2] = preview.selected.clone().unwrap_or_default();
+                }
+
                 if matches!(command, "image-remove" | "image-rename") {
                     form.values[1] = inner_path(
                         &preview.directory,
@@ -2362,22 +2513,8 @@ impl App {
                     let index = if command == "image-import" { 2 } else { 1 };
                     form.values[index] = format!("{}/", preview.directory);
                 }
-                if matches!(
-                    command,
-                    "image-import" | "image-mkdir" | "image-remove" | "image-rename"
-                ) && preview.temp.is_none()
-                    && let Some(parent) = preview.image.parent()
-                    && !mount_read_only(parent)
-                {
-                    let stem = preview
-                        .image
-                        .file_stem()
-                        .unwrap_or_default()
-                        .to_string_lossy();
-                    *form.values.last_mut().unwrap() =
-                        new_image_path(parent, &format!("{stem} edited"))
-                            .to_string_lossy()
-                            .into_owned();
+                if is_disk_edit(command) {
+                    form.bind_editor(&preview);
                 }
             }
         }
@@ -2510,11 +2647,12 @@ fn disk_menu(
                 }
                 ui.menu_button("Edit disk contents", |ui| {
                     for (label, cmd) in [
+                        ("Change disk label…", "image-label"),
                         ("Add a file…", "image-import"),
                         ("Create a folder…", "image-mkdir"),
                         ("Extract a file…", "image-extract"),
                         ("Rename an entry…", "image-rename"),
-                        ("Remove an entry from a copy…", "image-remove"),
+                        ("Remove a file or empty folder…", "image-remove"),
                     ] {
                         if menu_item(ui, label, true) {
                             action = Some(DiskAction::Command(cmd));
@@ -2546,6 +2684,74 @@ fn disk_menu(
     }
     action
 }
+fn is_disk_edit(command: &str) -> bool {
+    matches!(
+        command,
+        "image-import" | "image-mkdir" | "image-remove" | "image-rename" | "image-label"
+    )
+}
+
+fn open_editor(row: &DiskRow, profile: &str) -> Result<Preview, String> {
+    let (source, bank_temp) = disk_snapshot(row, profile)?;
+    let (image, temp) = if let Some(temp) = bank_temp {
+        (source, temp)
+    } else {
+        let temp = Arc::new(tempfile::tempdir().map_err(|e| e.to_string())?);
+        let image = temp.path().join("disk.img");
+        crate::copy_new(&source, &image).map_err(|e| e.to_string())?;
+        (image, temp)
+    };
+    Ok(Preview {
+        target: row.path.clone(),
+        bank: row.bank.map(|n| (profile.into(), n)),
+        entries: crate::fat12::directory_entries(&image, "/")
+            .map_err(|e| format!("Cannot edit this disk as FAT12: {e}"))?,
+        label: crate::fat12::volume_label(&image).map_err(|e| e.to_string())?,
+        image,
+        temp: Some(temp),
+        directory: "/".into(),
+        selected: None,
+        title: row.name.clone(),
+    })
+}
+
+fn save_editor(form: &Form) -> Result<Preview, String> {
+    let preview = form.editor.as_ref().ok_or("No disk is open")?;
+    let edit = || -> crate::Result<Preview> {
+        // Staging stays in a temporary directory; it is never a user-managed
+        // backup or an image the user must apply later.
+        let temp = Arc::new(tempfile::tempdir()?);
+        let image = temp.path().join("disk.img");
+        let input = &preview.image;
+        let v = &form.values;
+        match form.command.as_str() {
+            "image-import" => crate::fat12::import(input, Path::new(&v[1]), &v[2], &image)?,
+            "image-mkdir" => crate::fat12::mkdir(input, &v[1], &image)?,
+            "image-remove" => crate::fat12::remove(input, &v[1], &image)?,
+            "image-rename" => crate::fat12::rename(input, &v[1], &v[2], &image)?,
+            "image-label" => crate::fat12::set_label(input, &v[1], &image)?,
+            _ => return Err("Unsupported disk edit".into()),
+        }
+        let entries = crate::fat12::directory_entries(&image, &preview.directory)?;
+        let label = crate::fat12::volume_label(&image)?;
+        crate::banks::edit_disk(
+            &preview.target,
+            preview.bank.as_ref().map(|(p, n)| (p.as_str(), *n)),
+            &fs::read(input)?,
+            &fs::read(&image)?,
+        )?;
+        Ok(Preview {
+            image,
+            temp: Some(temp),
+            entries,
+            label,
+            selected: None,
+            ..preview.clone()
+        })
+    };
+    edit().map_err(|e| e.to_string())
+}
+
 fn disk_snapshot(
     row: &DiskRow,
     profile: &str,
@@ -2584,6 +2790,31 @@ fn new_image_path(directory: &Path, stem: &str) -> PathBuf {
     }
     candidate
 }
+fn suggest_dos_name(name: &str) -> String {
+    if crate::fat12::validate_short_name(name).is_ok() {
+        return name.to_ascii_uppercase();
+    }
+    let (base, extension) = name.rsplit_once('.').unwrap_or((name, ""));
+    let clean = |value: &str, limit: usize| {
+        value
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .take(limit)
+            .collect::<String>()
+            .to_ascii_uppercase()
+    };
+    let mut base = clean(base, 8);
+    if base.is_empty() {
+        base = "FILE".into();
+    }
+    let extension = clean(extension, 3);
+    if extension.is_empty() {
+        base
+    } else {
+        format!("{base}.{extension}")
+    }
+}
+
 fn inner_path(directory: &str, name: &str) -> String {
     if directory == "/" {
         name.into()
@@ -2635,6 +2866,83 @@ fn export_row(row: &DiskRow, profile: &str, dest: &Path) -> Result<(), String> {
     }
 }
 fn backend(args: Vec<String>) -> Result<String, String> {
+    // Raw-device operations share the GUI's authentication identity. Running
+    // them as separate CLI processes causes needless polkit prompts.
+    let words: Vec<_> = args.iter().map(String::as_str).collect();
+    let device_operation = || -> crate::Result<Option<String>> {
+        let message = match words.as_slice() {
+            ["bank-export", source, profile, bank, dest] => {
+                crate::banks::export(Path::new(source), profile, bank.parse()?, Path::new(dest))?;
+                format!("Exported bank {bank} to {dest}")
+            }
+            ["bank-backup", source, dest] => {
+                crate::banks::backup(Path::new(source), Path::new(dest))?;
+                format!(
+                    "Saved whole-device backup to {dest}. Use Verify backup to compare it with the source."
+                )
+            }
+            ["bank-verify", source, backup] => {
+                crate::banks::verify(Path::new(source), Path::new(backup))?;
+                "Backup verified byte for byte".into()
+            }
+            ["bank-list", source, profile] => {
+                let catalog = crate::banks::catalog(Path::new(source), profile)?;
+                format!(
+                    "Source: {source}\nProfile: {profile}\nCapacity: {} bytes; stride: {}; payload: {}\nBoot headers only; not a filesystem check.\n{}",
+                    catalog.size,
+                    catalog.stride,
+                    catalog.payload,
+                    catalog
+                        .rows
+                        .iter()
+                        .map(|e| format!("{:03}  {}  {}", e.number, e.status, e.label))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                )
+            }
+            [
+                "bank-write",
+                target,
+                profile,
+                bank,
+                image,
+                expected,
+                recovery,
+                "--confirm-write",
+            ] => {
+                crate::banks::write_bank(
+                    Path::new(target),
+                    profile,
+                    bank.parse()?,
+                    Path::new(image),
+                    Path::new(expected),
+                    Path::new(recovery),
+                )?;
+                format!("Bank {bank} written and verified. Recovery image: {recovery}")
+            }
+            [
+                "device-restore",
+                target,
+                image,
+                expected,
+                recovery,
+                "--confirm-write",
+            ] => {
+                crate::banks::restore_device(
+                    Path::new(target),
+                    Path::new(image),
+                    Path::new(expected),
+                    Path::new(recovery),
+                )?;
+                format!("Device restored and verified. Recovery image: {recovery}")
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(message))
+    };
+    if let Some(message) = device_operation().map_err(|e| e.to_string())? {
+        return Ok(message);
+    }
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let mut command = std::process::Command::new(exe);
     command.args(args).stdin(std::process::Stdio::null());
@@ -2782,6 +3090,245 @@ mod tests {
     fn app() -> App {
         // Bank mode starts idle and never probes a real device.
         App::new(Some("unused-test-device".into()), &egui::Context::default())
+    }
+
+    #[test]
+    fn contents_editor_exposes_label_and_prefills_rename_in_current_folder() {
+        let temp = tempfile::tempdir().unwrap();
+        let blank = temp.path().join("blank.img");
+        let image = temp.path().join("disk.img");
+        crate::fat12::create(&blank, 1440).unwrap();
+        crate::fat12::mkdir(&blank, "SAMPLES", &image).unwrap();
+        let ctx = egui::Context::default();
+        visual::apply(&ctx);
+        let mut app = app();
+        app.preview = Some(Preview {
+            target: image.clone(),
+            bank: None,
+            label: "MY DISK".into(),
+            image: image.clone(),
+            directory: "/".into(),
+            entries: crate::fat12::directory_entries(&image, "/").unwrap(),
+            temp: None,
+            selected: Some("SAMPLES".into()),
+            title: "disk.img".into(),
+        });
+        render(&mut app, &ctx, vec![]);
+        let output = render(&mut app, &ctx, vec![]);
+        for label in [
+            "Change label",
+            "Add file",
+            "New folder",
+            "Open folder",
+            "Rename",
+            "Remove",
+        ] {
+            assert!(
+                text_position(&output.shapes, label).is_some(),
+                "{label} must be visible"
+            );
+        }
+        let label = text_position(&output.shapes, "Change label").unwrap();
+        click(&mut app, &ctx, label, egui::PointerButton::Primary);
+        let form = app.form.as_ref().unwrap();
+        assert_eq!(form.command, "image-label");
+        assert_eq!(form.values[1], "MY DISK");
+        assert!(form.args("").is_ok());
+        let output = render(&mut app, &ctx, vec![]);
+        assert!(text_position(&output.shapes, "Save changes").is_some());
+        assert!(text_position(&output.shapes, "Save edited copy as").is_none());
+        app.form = None;
+        render(&mut app, &ctx, vec![]);
+        let output = render(&mut app, &ctx, vec![]);
+        let rename = text_position(&output.shapes, "Rename").unwrap();
+        click(&mut app, &ctx, rename, egui::PointerButton::Primary);
+        let form = app.form.as_ref().unwrap();
+        assert_eq!(form.values[1], "SAMPLES");
+        assert_eq!(form.values[2], "SAMPLES");
+        assert_eq!(form.editor.as_ref().unwrap().target, image);
+    }
+
+    #[test]
+    fn device_worker_exports_and_verifies_without_a_cli_subprocess() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("banks.bin");
+        let exported = temp.path().join("disk.img");
+        let backup = temp.path().join("backup.bin");
+        crate::banks::create_layout(&source, "gotek720", 2, "minimum").unwrap();
+        let source = source.to_str().unwrap();
+        let run = |args: &[&str]| backend(args.iter().map(|s| s.to_string()).collect());
+        run(&[
+            "bank-export",
+            source,
+            "gotek720",
+            "1",
+            exported.to_str().unwrap(),
+        ])
+        .unwrap();
+        assert_eq!(crate::fat12::volume_label(&exported).unwrap(), "FDISK001");
+        run(&["bank-backup", source, backup.to_str().unwrap()]).unwrap();
+        run(&["bank-verify", source, backup.to_str().unwrap()]).unwrap();
+        assert!(
+            run(&[
+                "bank-export",
+                source,
+                "gotek720",
+                "1",
+                exported.to_str().unwrap()
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn import_suggestions_and_inline_validation_handle_long_names() {
+        assert_eq!(suggest_dos_name("My long sample.wav"), "MYLONGSA.WAV");
+        assert_eq!(suggest_dos_name("a-b.txt"), "A-B.TXT");
+        assert!(crate::fat12::validate_short_name(&suggest_dos_name("🎵.wav")).is_ok());
+        let op = OPS.iter().find(|o| o.command == "image-import").unwrap();
+        let mut form = Form::operation(op);
+        form.values = vec![
+            "disk.img".into(),
+            "source.txt".into(),
+            "DIR/TOOLONGNAME.TXT".into(),
+            "copy.img".into(),
+        ];
+        assert!(form.args("").is_err());
+        form.values[2] = "DIR/NOTES.TXT".into();
+        assert!(form.args("").is_ok());
+    }
+
+    fn edit_form(preview: &Preview, command: &str, fields: &[&str]) -> Form {
+        let mut form = Form::operation(OPS.iter().find(|op| op.command == command).unwrap());
+        form.bind_editor(preview);
+        for (value, field) in form.values[1..].iter_mut().zip(fields) {
+            *value = (*field).into();
+        }
+        form
+    }
+
+    fn editor_row(path: &Path, bank: Option<u16>) -> DiskRow {
+        DiskRow {
+            key: "test".into(),
+            name: "Test disk".into(),
+            kind: "FAT12".into(),
+            size: 0,
+            path: path.into(),
+            bank,
+            directory: false,
+            recognized: true,
+        }
+    }
+
+    #[test]
+    fn direct_editor_changes_the_same_image_and_keeps_current_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let disk = temp.path().join("disk.img");
+        let file = temp.path().join("sample.txt");
+        crate::fat12::create(&disk, 1440).unwrap();
+        fs::write(&file, b"sample content").unwrap();
+        let mut preview = open_editor(&editor_row(&disk, None), "gotek1440").unwrap();
+        preview = save_editor(&edit_form(&preview, "image-label", &["MY SAMPLES"])).unwrap();
+        assert_eq!(crate::fat12::volume_label(&disk).unwrap(), "MY SAMPLES");
+        preview = save_editor(&edit_form(&preview, "image-mkdir", &["SAMPLES"])).unwrap();
+        preview.directory = "SAMPLES".into();
+        preview = save_editor(&edit_form(
+            &preview,
+            "image-import",
+            &[file.to_str().unwrap(), "SAMPLES/NOTE.TXT"],
+        ))
+        .unwrap();
+        assert_eq!(preview.directory, "SAMPLES");
+        assert_eq!(
+            crate::fat12::directory_entries(&disk, "SAMPLES").unwrap()[0].name,
+            "NOTE.TXT"
+        );
+        preview = save_editor(&edit_form(
+            &preview,
+            "image-rename",
+            &["SAMPLES/NOTE.TXT", "NEW.TXT"],
+        ))
+        .unwrap();
+        assert_eq!(preview.entries[0].name, "NEW.TXT");
+        preview = save_editor(&edit_form(&preview, "image-remove", &["SAMPLES/NEW.TXT"])).unwrap();
+        assert!(
+            crate::fat12::directory_entries(&disk, "SAMPLES")
+                .unwrap()
+                .is_empty()
+        );
+        preview.directory = "/".into();
+        let preview = save_editor(&edit_form(&preview, "image-remove", &["SAMPLES"])).unwrap();
+        assert_eq!(preview.target, disk);
+        assert!(
+            crate::fat12::directory_entries(&disk, "/")
+                .unwrap()
+                .is_empty()
+        );
+        crate::fat12::check(&disk).unwrap();
+        assert_eq!(
+            fs::read_dir(temp.path()).unwrap().count(),
+            2,
+            "no backup or edited copies alongside the disk"
+        );
+    }
+
+    #[test]
+    fn direct_bank_edits_preserve_other_banks_and_reject_stale_snapshots() {
+        let temp = tempfile::tempdir().unwrap();
+        let disk = temp.path().join("banks.bin");
+        crate::banks::create_layout(&disk, "gotek1440", 3, "minimum").unwrap();
+        let original = fs::read(&disk).unwrap();
+        let row = editor_row(&disk, Some(1));
+        let preview = open_editor(&row, "gotek1440").unwrap();
+        let stale = preview.clone();
+        let preview = save_editor(&edit_form(&preview, "image-label", &["DIRECT"])).unwrap();
+        let preview = save_editor(&edit_form(&preview, "image-mkdir", &["SAMPLES"])).unwrap();
+        let result = fs::read(&disk).unwrap();
+        let offset = 0x180000;
+        let end = offset + 1440 * 1024;
+        assert_eq!(&result[..offset], &original[..offset]);
+        assert_eq!(&result[end..], &original[end..]);
+        assert_eq!(&result[offset..end], fs::read(&preview.image).unwrap());
+        assert_eq!(
+            crate::banks::catalog(&disk, "gotek1440").unwrap().rows[1].label,
+            "DIRECT"
+        );
+        let error = save_editor(&edit_form(&stale, "image-label", &["STALE"]))
+            .err()
+            .unwrap();
+        assert!(error.contains("Disk changed"), "{error}");
+        assert_eq!(fs::read(&disk).unwrap(), result);
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn direct_image_edits_refuse_conflicts_locks_and_invalid_edits() {
+        let temp = tempfile::tempdir().unwrap();
+        let disk = temp.path().join("disk.img");
+        crate::fat12::create(&disk, 720).unwrap();
+        let preview = open_editor(&editor_row(&disk, None), "gotek720").unwrap();
+        let original = fs::read(&disk).unwrap();
+        assert!(save_editor(&edit_form(&preview, "image-mkdir", &["INVALID LONG NAME"])).is_err());
+        assert_eq!(fs::read(&disk).unwrap(), original);
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&disk)
+            .unwrap();
+        lock.try_lock().unwrap();
+        assert!(save_editor(&edit_form(&preview, "image-label", &["LOCKED"])).is_err());
+        assert_eq!(fs::read(&disk).unwrap(), original);
+        drop(lock);
+        let mut changed = original;
+        changed[39] ^= 1;
+        fs::write(&disk, &changed).unwrap();
+        assert!(
+            save_editor(&edit_form(&preview, "image-label", &["STALE"]))
+                .err()
+                .unwrap()
+                .contains("Disk changed")
+        );
+        assert_eq!(fs::read(&disk).unwrap(), changed);
     }
 
     #[test]

@@ -1553,3 +1553,50 @@ fn created_banks_external_interoperability() {
         }
     }
 }
+
+#[test]
+fn disk_labels_update_both_records_and_preserve_files_and_originals() {
+    let s = Sandbox::new();
+    s.ok(&["create-fat12", "blank.img", "1440"]);
+    fs::write(s.0.join("notes.txt"), b"keep me").unwrap();
+    s.ok(&[
+        "image-import",
+        "blank.img",
+        "notes.txt",
+        "NOTES.TXT",
+        "disk.img",
+    ]);
+    let original = fs::read(s.0.join("disk.img")).unwrap();
+    s.ok(&["image-label", "disk.img", "my samples", "labelled.img"]);
+    s.ok(&["image-label", "labelled.img", "SYNTH 2", "renamed.img"]);
+    s.ok(&["image-check", "renamed.img"]);
+    s.ok(&["image-extract", "renamed.img", "NOTES.TXT", "export.txt"]);
+    assert_eq!(fs::read(s.0.join("export.txt")).unwrap(), b"keep me");
+    assert_eq!(fs::read(s.0.join("disk.img")).unwrap(), original);
+    let labelled = fs::read(s.0.join("renamed.img")).unwrap();
+    assert_eq!(&labelled[43..54], b"SYNTH 2    ");
+    let root = 19 * 512;
+    let labels: Vec<_> = labelled[root..root + 224 * 32]
+        .as_chunks::<32>()
+        .0
+        .iter()
+        .take_while(|e| e[0] != 0)
+        .filter(|e| e[0] != 0xe5 && e[11] == 8)
+        .collect();
+    assert_eq!(labels.len(), 1);
+    assert_eq!(&labels[0][..11], b"SYNTH 2    ");
+    for invalid in ["", "TOO LONG A LABEL", "BAD/NAME", "é", "BAD.NAME"] {
+        assert!(
+            !s.run(&["image-label", "disk.img", invalid, "invalid.img"])
+                .status
+                .success()
+        );
+        assert!(!s.0.join("invalid.img").exists());
+    }
+    assert!(
+        !s.run(&["image-label", "disk.img", "LABEL", "renamed.img"])
+            .status
+            .success()
+    );
+    assert_eq!(fs::read(s.0.join("renamed.img")).unwrap(), labelled);
+}

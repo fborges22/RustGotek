@@ -598,6 +598,83 @@ fn save_new(data: &[u8], output: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Set both DOS volume-label records while preserving the source image.
+pub fn set_label(path: &Path, label: &str, output: &Path) -> Result<()> {
+    let encoded = encode_label(label)?;
+    let mut image = Image::open(path)?;
+    image.check_references()?;
+    let offsets = image.directory_offsets(None)?;
+    let active: Vec<_> = offsets
+        .iter()
+        .copied()
+        .take_while(|&at| image.data[at] != 0)
+        .filter(|&at| image.data[at] != 0xe5 && image.data[at + 11] == 8)
+        .collect();
+    let slot = active
+        .first()
+        .copied()
+        .or_else(|| {
+            offsets
+                .iter()
+                .copied()
+                .find(|&at| matches!(image.data[at], 0 | 0xe5))
+        })
+        .ok_or("Root directory is full; no room for a disk label")?;
+    if image.data[slot] == 0 && slot + 32 < image.data_start {
+        image.data[slot + 32] = 0;
+    }
+    for &at in active.iter().skip(1) {
+        image.data[at] = 0xe5;
+    }
+    image.data[slot..slot + 32].fill(0);
+    image.data[slot..slot + 11].copy_from_slice(&encoded);
+    image.data[slot + 11] = 8;
+    if image.data[38] == 0x29 {
+        image.data[43..54].copy_from_slice(&encoded);
+    }
+    save_new(&image.data, output)
+}
+
+pub fn encode_label(label: &str) -> Result<[u8; 11]> {
+    let label = label.trim();
+    if label.is_empty()
+        || label.len() > 11
+        || !label
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b" !#$%&'()-@^_`{}~".contains(&b))
+    {
+        return Err("Use 1–11 ASCII letters, numbers, spaces or DOS label punctuation".into());
+    }
+    let mut encoded = [b' '; 11];
+    encoded[..label.len()].copy_from_slice(label.to_ascii_uppercase().as_bytes());
+    Ok(encoded)
+}
+
+pub fn volume_label(path: &Path) -> Result<String> {
+    let image = Image::open(path)?;
+    for at in image.directory_offsets(None)? {
+        if image.data[at] == 0 {
+            break;
+        }
+        if image.data[at] != 0xe5 && image.data[at + 11] == 8 {
+            return Ok(String::from_utf8_lossy(&image.data[at..at + 11])
+                .trim_end()
+                .into());
+        }
+    }
+    Ok(if image.data[38] == 0x29 {
+        String::from_utf8_lossy(&image.data[43..54])
+            .trim_end()
+            .into()
+    } else {
+        String::new()
+    })
+}
+
+pub fn validate_short_name(name: &str) -> Result<()> {
+    short_name(name).map(|_| ())
+}
+
 pub fn remove(path: &Path, name: &str, output: &Path) -> Result<()> {
     let mut image = Image::open(path)?;
     image.check_references()?;

@@ -91,9 +91,24 @@ fn linux_authorized_open(path: &Path, write: bool) -> Result<File> {
         zvariant::{OwnedFd, Value},
     };
     let expected_device = fs::metadata(path)?.rdev();
-    let connection = Builder::system()?
-        .method_timeout(Duration::from_secs(120))
-        .build()?;
+    // Keep the same D-Bus caller for the application's lifetime so polkit can
+    // reuse its retained authorization. Failed/cancelled authorization is not
+    // cached, and device descriptors remain scoped to each operation.
+    static CONNECTION: std::sync::Mutex<Option<zbus::blocking::Connection>> =
+        std::sync::Mutex::new(None);
+    let connection = {
+        let mut cached = CONNECTION
+            .lock()
+            .map_err(|_| "Authorization connection lock failed")?;
+        if cached.is_none() {
+            *cached = Some(
+                Builder::system()?
+                    .method_timeout(Duration::from_secs(120))
+                    .build()?,
+            );
+        }
+        cached.as_ref().unwrap().clone()
+    };
     let manager = Proxy::new(
         &connection,
         "org.freedesktop.UDisks2",
@@ -443,6 +458,67 @@ fn replace_with_recovery(
     Ok(())
 }
 
+/// Commit a disk-editor change directly, with no persistent backup file.
+/// A bank target changes only its payload; a standalone image must match in full.
+pub fn edit_disk(
+    target: &Path,
+    bank: Option<(&str, u16)>,
+    expected: &[u8],
+    replacement: &[u8],
+) -> Result<()> {
+    if expected.len() != replacement.len() || expected.is_empty() {
+        return Err("Edited disk has a different size; no changes made".into());
+    }
+    crate::fat12::inspect(replacement)?;
+    let layout = bank
+        .map(|(profile, number)| -> Result<(Profile, u16)> {
+            let layout = Profile::parse(profile)?;
+            layout.offset(number, u64::MAX)?;
+            if expected.len() as u64 != layout.payload {
+                return Err("Editor snapshot has the wrong bank capacity".into());
+            }
+            Ok((layout, number))
+        })
+        .transpose()?;
+    if bank.is_none() && !fs::metadata(target)?.is_file() {
+        return Err("Standalone disk edits require an image file".into());
+    }
+    let mut file = open_write_target(target)?;
+    let size = file.seek(SeekFrom::End(0))?;
+    let offset = if let Some((layout, number)) = layout {
+        layout.offset(number, size)?
+    } else {
+        if size != expected.len() as u64 {
+            return Err("Disk size changed; reopen it before editing. No changes made".into());
+        }
+        0
+    };
+    if read_bank(&mut file, offset, expected.len())? != expected {
+        return Err(
+            "Disk changed since it was opened; reopen it before editing. No changes made".into(),
+        );
+    }
+    if expected == replacement {
+        return Ok(());
+    }
+    save_editor_bytes(&mut file, offset, expected, replacement)
+}
+
+fn save_editor_bytes(
+    target: &mut impl BankIo,
+    offset: u64,
+    expected: &[u8],
+    replacement: &[u8],
+) -> Result<()> {
+    if let Err(error) = write_verified(target, offset, replacement) {
+        return match write_verified(target, offset, expected) {
+            Ok(()) => Err(format!("Save failed ({error}); original contents restored and verified").into()),
+            Err(restore) => Err(format!("Save failed ({error}); restoring original contents also failed ({restore}). Disk may be incomplete").into()),
+        };
+    }
+    Ok(())
+}
+
 /// Caller requires explicit user confirmation. No input path is truncated or
 /// reformatted. The expected original prevents blindly replacing a changed bank.
 pub fn write_bank(
@@ -745,6 +821,31 @@ mod write_tests {
         .unwrap_err();
         assert!(error.to_string().contains("automatic recovery also failed"));
     }
+    #[test]
+    fn editor_save_restores_partial_writes_without_a_backup_file() {
+        let original = vec![7; 32];
+        let mut target = Faulty {
+            bytes: Cursor::new(original.clone()),
+            remaining: 3,
+            permanent: false,
+        };
+        let error = save_editor_bytes(&mut target, 8, &[7; 16], &[9; 16]).unwrap_err();
+        assert!(error.to_string().contains("restored and verified"));
+        assert_eq!(target.bytes.into_inner(), original);
+    }
+
+    #[test]
+    fn editor_save_reports_failed_rollback() {
+        let mut target = Faulty {
+            bytes: Cursor::new(vec![7; 32]),
+            remaining: 3,
+            permanent: true,
+        };
+        let error = save_editor_bytes(&mut target, 8, &[7; 16], &[9; 16]).unwrap_err();
+        assert!(error.to_string().contains("Disk may be incomplete"));
+        assert!(!error.to_string().contains("recovery file"));
+    }
+
     struct Faulty {
         bytes: Cursor<Vec<u8>>,
         remaining: usize,

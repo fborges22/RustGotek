@@ -61,6 +61,7 @@ Commands:
   image-import PATH SOURCE NAME OUT Add a file and save a new FAT12 image
   image-mkdir PATH NAME OUT         Create a directory in a new FAT12 image
   image-remove PATH NAME OUT        Remove a file or empty directory to new image
+  image-label PATH LABEL OUT       Set the disk label in a new FAT12 image
   image-rename PATH NAME NEW OUT    Rename within its FAT12 directory to new image
 
 ROOT must be an existing mounted directory. Bank SOURCE can be a readable block
@@ -425,6 +426,9 @@ fn run(a: &[String]) -> Result<()> {
         ["firmware-inspect", path] => firmware::inspect(Path::new(path))?,
         ["firmware-stage", r, path, model] => firmware::stage(&root(r)?, Path::new(path), model)?,
         ["image-check", path] => fat12::check(Path::new(path))?,
+        ["image-label", path, label, output] => {
+            fat12::set_label(Path::new(path), label, Path::new(output))?
+        }
         ["image-rename", path, name, new_name, output] => {
             fat12::rename(Path::new(path), name, new_name, Path::new(output))?
         }
