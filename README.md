@@ -112,8 +112,29 @@ CLI commands remain available without a display. To launch in your bank workspac
 cargo run -- gui banks /dev/sda
 ```
 
-On Windows the executable is `target\release\rustgotek.exe`. To install the
-command into your Cargo binary directory, use `cargo install --path . --locked`.
+On Windows the executable is `target\release\rustgotek.exe`. The application
+icon is in `assets/` as a PNG for Linux desktops, an ICO for Windows, and an
+ICNS for macOS; the GUI window/taskbar icon is embedded from the PNG on all
+platforms. On KDE, install into your user account and add an application-menu
+entry and icon with:
+
+```sh
+cargo install --path . --locked --root "$HOME/.local"
+install -Dm644 assets/rustgotek.png \
+  "$HOME/.local/share/icons/hicolor/512x512/apps/org.rustgotek.RustGotek.png"
+mkdir -p "$HOME/.local/share/applications"
+cat > "$HOME/.local/share/applications/org.rustgotek.RustGotek.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=RustGotek
+Comment=Manage Gotek USB media
+Exec=$HOME/.local/bin/rustgotek
+Icon=org.rustgotek.RustGotek
+Terminal=false
+Categories=Utility;
+EOF
+```
+
 Run `rustgotek --help` for the complete command list. Errors return exit code 1;
 successful operations return 0. Commands work on image files and mounted media
 directories; no administrative access is normally needed.

@@ -580,53 +580,28 @@ pub fn empty_art(ui: &mut Ui, glyph: Icon) {
 
 /// Native window/task-switcher icon matching the vector mark in the title bar.
 pub fn app_icon() -> egui::IconData {
-    let segments: &[(f32, f32, f32, f32)] = &[
-        (3., 3., 17., 3.),
-        (17., 3., 21., 7.),
-        (21., 7., 21., 21.),
-        (21., 21., 3., 21.),
-        (3., 21., 3., 3.),
-        (7., 3., 7., 9.),
-        (7., 9., 16., 9.),
-        (16., 9., 16., 3.),
-        (7., 21., 7., 14.),
-        (7., 14., 17., 14.),
-        (17., 14., 17., 21.),
-    ];
-    let mut rgba = Vec::with_capacity(64 * 64 * 4);
-    for y in 0..64 {
-        for x in 0..64 {
-            let px = x as f32 + 0.5;
-            let py = y as f32 + 0.5;
-            let dx = (px - 32.).abs() - 20.;
-            let dy = (py - 32.).abs() - 20.;
-            let outside = dx.max(0.).hypot(dy.max(0.)) > 12.;
-            let point = egui::vec2((px - 8.) / 2., (py - 8.) / 2.);
-            let ink = segments.iter().any(|&(ax, ay, bx, by)| {
-                let a = egui::vec2(ax, ay);
-                let direction = egui::vec2(bx - ax, by - ay);
-                let t = ((point - a).dot(direction) / direction.length_sq()).clamp(0., 1.);
-                (point - a - direction * t).length() < 0.8
-            });
-            rgba.extend_from_slice(&if outside {
-                [0, 0, 0, 0]
-            } else if ink {
-                [255, 255, 255, 255]
-            } else {
-                [49, 94, 231, 255]
-            });
-        }
-    }
+    let image = image::load_from_memory(include_bytes!("../../assets/rustgotek.png"))
+        .expect("embedded app icon is a valid PNG")
+        .into_rgba8();
+    let (width, height) = image.dimensions();
     egui::IconData {
-        rgba,
-        width: 64,
-        height: 64,
+        rgba: image.into_raw(),
+        width,
+        height,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn app_icon_is_valid_rgba() {
+        let icon = app_icon();
+        assert_eq!(icon.width, 512);
+        assert_eq!(icon.height, 512);
+        assert_eq!(icon.rgba.len(), (icon.width * icon.height * 4) as usize);
+    }
+
     #[test]
     fn system_theme_changes_and_manual_overrides_update_all_surfaces() {
         let ctx = egui::Context::default();
