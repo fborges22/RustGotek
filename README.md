@@ -59,8 +59,20 @@ for changes. If the desktop reports no preference, System uses the light theme.
   correction. Disk labels support up to 11 ASCII characters including spaces.
 - **Gotek USB banks:** enter a raw device such as `/dev/sda` or choose a whole-device
   backup, select the bank profile, and click **Scan banks**. Select banks to export
-  them individually or in batches. **Replace → Replace bank with recovery** takes a replacement image and
-  a new recovery path, then shows the target for review before writing.
+  them individually or in batches.
+- **Load a floppy image into a bank:** drag an image file from your file manager
+  and drop it onto a bank row, or select a bank and click **Load image**. A short
+  review names the bank, its current disk and the new image (label and size) —
+  click **Write to bank NNN**. Raw `.img`/`.ima` images and HFE images (converted
+  automatically) are accepted; an image of the wrong size is explained before
+  anything is written, including when it fits the other bank profile. The current
+  bank is saved automatically as a recovery image in
+  `~/.local/share/RustGotek/recovery/` (`%APPDATA%\RustGotek\recovery` on Windows,
+  `~/Library/Application Support/RustGotek/recovery` on macOS); click **Back** to
+  choose another image or recovery location.
+- **Drag and drop elsewhere:** dropping image files on the image library imports
+  them into the open folder; dropping files while a disk's contents are open adds
+  them to that disk (with the usual batch review).
 - **Toolbar menus:** Check provides filesystem checks and format inspection;
   Backup groups create, verify and restore; Convert offers raw/HFE conversion;
   Device contains source reports, indexed slots, FlashFloppy settings and firmware.
@@ -181,7 +193,7 @@ free space. Keep the source unmounted or read-only and unchanged throughout
 backup and verification. Replacement requires a regular backup file and an
 exactly sized raw floppy image. It creates a new file, preserves padding and
 all other bytes, and reads back the changed bank. All output paths must be new.
-**Replace → Replace bank with recovery** on a selected table row captures an expected original, saves a
+**Load image** (or **Replace → Load image into bank…**) on a selected table row captures an expected original, saves a
 recovery image, writes the replacement and verifies it after confirmation. For an
 explicit expected-original file, use **Replace → Use an expected-original image**.
 The CLI requires the explicit confirmation flag:

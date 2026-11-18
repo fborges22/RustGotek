@@ -582,6 +582,8 @@ struct Form {
     editor: Option<Preview>,
     batch: Option<Vec<DiskEdit>>,
     eject: Option<crate::usb::Plan>,
+    /// Plain-language review lines shown instead of the raw field list.
+    summary: Vec<String>,
 }
 impl Form {
     fn operation(op: &Operation) -> Self {
@@ -600,6 +602,7 @@ impl Form {
             editor: None,
             batch: None,
             eject: None,
+            summary: vec![],
         }
     }
     fn bind_editor(&mut self, preview: &Preview) {
@@ -662,6 +665,7 @@ enum Event {
     Folder(Option<PathBuf>),
     Source(Option<PathBuf>),
     Ejected,
+    Cancelled(String),
 }
 struct App {
     appearance: visual::Appearance,
@@ -674,6 +678,8 @@ struct App {
     bank_identity: Option<(String, String)>,
     rows: Vec<DiskRow>,
     selected: BTreeSet<String>,
+    /// Bank row under the pointer, used as the target for dropped images.
+    drop_row: Option<String>,
     filter: String,
     show_all: bool,
     sort: Sort,
@@ -715,6 +721,7 @@ impl App {
             bank_identity: None,
             rows: vec![],
             selected: BTreeSet::new(),
+            drop_row: None,
             filter: String::new(),
             show_all: false,
             sort: if bank_source.is_some() {
@@ -778,6 +785,10 @@ impl App {
                     self.status = "Operation failed — correct the fields and try again".into();
                     self.log = error;
                     self.show_log = true;
+                }
+                Ok(Event::Cancelled(status)) => {
+                    self.error = false;
+                    self.status = status;
                 }
                 Ok(Event::Ejected) => {
                     self.clear();
@@ -1075,21 +1086,36 @@ impl App {
             Ok(Event::Done(format!("Exported {} disks to {}", rows.len(), dest.display())))
         });
     }
-    fn import_images(&mut self, ctx: &egui::Context) {
+    fn import_images(&mut self, ctx: &egui::Context, dropped: Option<Vec<PathBuf>>) {
         let Some(listing) = &self.listing else {
             return;
         };
         let dest = listing.directory.clone();
         self.worker(ctx, "Choose images to add…", move || {
-            let Some(files) = rfd::FileDialog::new()
-                .add_filter(
-                    "Disk images",
-                    &["img", "ima", "hfe", "adf", "dsk", "st", "ssd", "dsd", "trd"],
-                )
-                .pick_files()
-            else {
-                return Ok(Event::Done("Import cancelled".into()));
+            let files = match dropped {
+                Some(files) => files,
+                None => match rfd::FileDialog::new()
+                    .add_filter(
+                        "Disk images",
+                        &["img", "ima", "hfe", "adf", "dsk", "st", "ssd", "dsd", "trd"],
+                    )
+                    .pick_files()
+                {
+                    Some(files) => files,
+                    None => return Ok(Event::Cancelled("Import cancelled".into())),
+                },
             };
+            let rejected: Vec<_> = files
+                .iter()
+                .filter(|f| !f.is_file() || !is_image(&f.to_string_lossy()))
+                .map(|f| f.display().to_string())
+                .collect();
+            if !rejected.is_empty() {
+                return Err(format!(
+                    "Only disk image files can be added to the library. Nothing imported. Not accepted:\n{}",
+                    rejected.join("\n")
+                ));
+            }
             for (i, file) in files.iter().enumerate() {
                 let name = file
                     .file_name()
@@ -1106,12 +1132,66 @@ impl App {
             Ok(Event::Done(format!("Imported {} images", files.len())))
         });
     }
+    /// One-step "put this floppy on that bank": pick (or drop) an image, then
+    /// confirm a plain-language summary. Recovery is automatic.
+    fn load_into_bank(&mut self, ctx: &egui::Context, row: &DiskRow, image: Option<PathBuf>) {
+        let Some(bank) = row.bank else {
+            return;
+        };
+        self.selected = BTreeSet::from([row.key.clone()]);
+        self.replace_bank_form(row);
+        let mut form = self.form.take().unwrap();
+        let current = row.clone();
+        self.worker(
+            ctx,
+            &format!("Choose an image for bank {bank:03}…"),
+            move || {
+                let image = match image {
+                    Some(image) => image,
+                    None => match rfd::FileDialog::new()
+                        .set_title(format!("Load a floppy image into bank {bank:03}"))
+                        .add_filter("Floppy images", &["img", "ima", "hfe", "dsk", "bin"])
+                        .add_filter("All files", &["*"])
+                        .pick_file()
+                    {
+                        Some(image) => image,
+                        None => return Ok(Event::Cancelled("Load cancelled".into())),
+                    },
+                };
+                form.values[3] = image.to_string_lossy().into_owned();
+                Ok(prepare_bank_load(form, &current))
+            },
+        );
+    }
+    fn reprepare_bank_load(&mut self, ctx: &egui::Context, form: Form) {
+        let bank = form.values[2].parse::<u16>().ok();
+        let current = self
+            .rows
+            .iter()
+            .find(|r| r.bank.is_some() && r.bank == bank)
+            .cloned()
+            .unwrap_or(DiskRow {
+                key: String::new(),
+                name: format!("Bank {}", form.values[2]),
+                kind: "Unknown".into(),
+                size: 0,
+                path: PathBuf::from(&form.values[0]),
+                bank,
+                directory: false,
+                recognized: false,
+            });
+        self.worker(ctx, "Checking image…", move || {
+            Ok(prepare_bank_load(form, &current))
+        });
+    }
     fn replace_bank_form(&mut self, row: &DiskRow) {
+        let bank = row.bank.unwrap();
         self.form = Some(Form {
-            title: format!("Replace bank {:03}", row.bank.unwrap()),
+            title: format!("Load image into bank {bank:03}"),
             description: concat!(
-                "Save the current bank to a recovery image, write the replacement and verify it. ",
-                "The device must be unmounted. Other banks are preserved."
+                "Choose a floppy image to put in this bank. The current contents are saved as a ",
+                "recovery image first, then the new image is written and verified. ",
+                "The USB must be unmounted. Other banks are not touched."
             )
             .into(),
             command: "gui-replace-bank".into(),
@@ -1119,8 +1199,8 @@ impl App {
                 "Target",
                 "Profile",
                 "Bank",
-                "Replacement floppy image",
-                "New recovery image",
+                "Floppy image to load",
+                "Recovery copy of the current bank",
             ]
             .map(str::to_owned)
             .to_vec(),
@@ -1128,9 +1208,9 @@ impl App {
             values: vec![
                 self.source.clone(),
                 self.profile.clone(),
-                row.bank.unwrap().to_string(),
+                bank.to_string(),
                 String::new(),
-                String::new(),
+                default_recovery_path(bank).to_string_lossy().into_owned(),
             ],
             media: false,
             writes_media: false,
@@ -1140,6 +1220,7 @@ impl App {
             editor: None,
             batch: None,
             eject: None,
+            summary: vec![],
         });
     }
     fn execute_form(&mut self, ctx: &egui::Context) {
@@ -1200,6 +1281,14 @@ impl App {
             let result = (|| {
                 let output = if args[0] == "gui-replace-bank" {
                     let temp = tempfile::tempdir().map_err(|e| e.to_string())?;
+                    let image = raw_for_bank(Path::new(&args[4]), &args[2], temp.path())?;
+                    if let Some(parent) = Path::new(&args[5]).parent()
+                        && !parent.as_os_str().is_empty()
+                    {
+                        fs::create_dir_all(parent).map_err(|e| {
+                            format!("Cannot create recovery folder {}: {e}", parent.display())
+                        })?;
+                    }
                     let expected = temp
                         .path()
                         .join("original.img")
@@ -1217,7 +1306,7 @@ impl App {
                         args[1].clone(),
                         args[2].clone(),
                         args[3].clone(),
-                        args[4].clone(),
+                        image.to_string_lossy().into_owned(),
                         expected,
                         args[5].clone(),
                         "--confirm-write".into(),
@@ -1401,7 +1490,128 @@ impl App {
             });
         self.preview_window(ctx);
         self.form_window(ctx);
+        self.dropped_files(ctx);
+        self.drop_overlay(ctx);
         chrome::resize_borders(ctx);
+    }
+    /// The bank a dropped image goes to: the row under the pointer, otherwise
+    /// the single selected bank. The review step always names it explicitly.
+    fn drop_bank(&self) -> Option<DiskRow> {
+        if self.workspace != Workspace::Banks {
+            return None;
+        }
+        let key = self
+            .drop_row
+            .clone()
+            .or_else(|| match self.selection().as_slice() {
+                [row] if row.bank.is_some() => Some(row.key.clone()),
+                _ => None,
+            })?;
+        self.rows
+            .iter()
+            .find(|r| r.key == key && r.bank.is_some())
+            .cloned()
+    }
+    /// What dropping files now would do, or why it cannot.
+    fn drop_intent(&self) -> Result<String, String> {
+        if self.busy || self.form.is_some() {
+            return Err("Finish the current operation before dropping files".into());
+        }
+        if let Some(preview) = &self.preview {
+            return Ok(format!("Add to {} · {}", preview.title, preview.directory));
+        }
+        match self.workspace {
+            Workspace::Banks => self
+                .drop_bank()
+                .map(|r| format!("Load into bank {:03} · {}", r.bank.unwrap(), r.name))
+                .ok_or_else(|| {
+                    if self.rows.is_empty() {
+                        "Scan banks first, then drop the image onto a bank".into()
+                    } else {
+                        "Drop onto a bank row, or select a bank first".into()
+                    }
+                }),
+            Workspace::Images => {
+                if let Some(listing) = &self.listing {
+                    if listing.read_only {
+                        Err("This folder is read-only".into())
+                    } else {
+                        Ok(format!("Add images to {}", listing.directory.display()))
+                    }
+                } else {
+                    Err("Open an image folder first".into())
+                }
+            }
+        }
+    }
+    fn dropped_files(&mut self, ctx: &egui::Context) {
+        let files: Vec<PathBuf> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .filter_map(|f| f.path.clone())
+                .collect()
+        });
+        if files.is_empty() {
+            return;
+        }
+        if let Err(reason) = self.drop_intent() {
+            self.status = reason;
+            self.error = true;
+            return;
+        }
+        if let Some(preview) = self.preview.clone() {
+            self.worker(ctx, "Preparing dropped items…", move || {
+                let edits = plan_imports(&preview, &files)?;
+                Ok(Event::Prepared(batch_form(&preview, edits, false)))
+            });
+            return;
+        }
+        match self.workspace {
+            Workspace::Banks => {
+                let row = self.drop_bank().unwrap();
+                if let [file] = files.as_slice() {
+                    self.load_into_bank(ctx, &row, Some(file.clone()));
+                } else {
+                    self.status = "Drop one image at a time onto a bank".into();
+                    self.error = true;
+                }
+            }
+            Workspace::Images => self.import_images(ctx, Some(files)),
+        }
+    }
+    fn drop_overlay(&self, ctx: &egui::Context) {
+        let count = ctx.input(|i| i.raw.hovered_files.len());
+        if count == 0 {
+            return;
+        }
+        let colors = visual::colors(ctx);
+        let painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("drop-overlay"),
+        ));
+        let screen = ctx.content_rect();
+        painter.rect_filled(screen, 0., Color32::from_black_alpha(90));
+        let (text, color) = match self.drop_intent() {
+            Ok(text) => (text, colors.accent),
+            Err(text) => (text, colors.red),
+        };
+        let galley = painter.layout(
+            text,
+            egui::FontId::proportional(18.),
+            color,
+            (screen.width() - 120.).max(200.),
+        );
+        let card =
+            egui::Rect::from_center_size(screen.center(), galley.size() + egui::vec2(48., 36.));
+        painter.rect(
+            card,
+            12.,
+            colors.surface,
+            egui::Stroke::new(2_f32, color),
+            egui::StrokeKind::Inside,
+        );
+        painter.galley(card.min + egui::vec2(24., 18.), galley, color);
     }
     fn switch_workspace(&mut self, mode: Workspace, ctx: &egui::Context) {
         if self.workspace == mode {
@@ -1743,9 +1953,24 @@ impl App {
             )
             .clicked()
             {
-                self.import_images(ctx);
+                self.import_images(ctx, None);
             }
             toolbar_divider(ui);
+            let bank_target = selected.first().filter(|r| single && r.bank.is_some());
+            if banks
+                && visual::toolbar_button(
+                    ui,
+                    Icon::Import,
+                    "Load image",
+                    "Put a floppy image into the selected bank — or drop an image file onto a bank row",
+                    bank_target.is_some(),
+                    true,
+                )
+                .clicked()
+                && let Some(row) = bank_target
+            {
+                self.load_into_bank(ctx, row, None);
+            }
             if visual::toolbar_button(
                 ui,
                 Icon::Folder,
@@ -1775,12 +2000,12 @@ impl App {
                     ui,
                     Icon::Replace,
                     "Replace",
-                    "Replace the selected bank or edit a backup copy",
+                    "Advanced bank replacement options",
                     single,
                 );
                 egui::Popup::menu(&replace).show(|ui| {
-                    if menu_item(ui, "Replace bank with recovery…", true) {
-                        self.replace_bank_form(&selected[0]);
+                    if menu_item(ui, "Load image into bank…", true) {
+                        self.load_into_bank(ctx, &selected[0], None);
                     }
                     ui.separator();
                     if menu_item(ui, "Use an expected-original image…", true) {
@@ -1984,6 +2209,7 @@ impl App {
             editor: None,
             batch: None,
             eject: None,
+            summary: vec![],
         });
     }
     fn disk_command(&mut self, ctx: &egui::Context, command: &'static str) {
@@ -2041,7 +2267,7 @@ impl App {
             }
             DiskAction::Replace => {
                 if let [row] = selected.as_slice() {
-                    self.replace_bank_form(row);
+                    self.load_into_bank(ctx, row, None);
                 }
             }
             DiskAction::Trash => {
@@ -2072,6 +2298,7 @@ impl App {
     }
     fn table_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let visible = self.visible();
+        self.drop_row = None;
         if self.rows.is_empty() {
             ui.add_space(24.0);
             ui.vertical_centered(|ui| {
@@ -2090,9 +2317,9 @@ impl App {
                     "Your Gotek's disks will appear here"
                 });
                 ui.label(if self.workspace == Workspace::Images {
-                    "Choose an image folder above, or create your first floppy image."
+                    "Choose an image folder above, or create your first floppy image. Drop image files here to add them."
                 } else {
-                    "Enter the USB device path or select a whole-device backup, then Scan banks."
+                    "Enter the USB device path or select a whole-device backup, then Scan banks. To load a floppy image, drop it onto a bank or use Load image."
                 });
             });
             return;
@@ -2110,6 +2337,10 @@ impl App {
         let backup_file = self.source_is_file();
         let banks = self.workspace == Workspace::Banks;
         let height = (ui.available_height() - 20.0).max(100.0);
+        let pointer = ctx.input(|i| i.pointer.hover_pos());
+        let dragging = ctx.input(|i| !i.raw.hovered_files.is_empty());
+        let drop_key = self.drop_bank().filter(|_| dragging).map(|r| r.key);
+        let mut hovered_row = None;
         let mut table = TableBuilder::new(ui)
             .id_salt(("disk-table", banks))
             .sense(egui::Sense::click())
@@ -2161,7 +2392,7 @@ impl App {
                     let row = &self.rows[visible[tr.index()]];
                     let mut chosen = self.selected.contains(&row.key);
                     let mut widget_response: Option<egui::Response> = None;
-                    tr.set_selected(chosen);
+                    tr.set_selected(chosen || drop_key.as_ref() == Some(&row.key));
                     tr.col(|ui| {
                         let response = ui.checkbox(&mut chosen, "");
                         widget_response = Some(response.clone());
@@ -2239,6 +2470,9 @@ impl App {
                         );
                     });
                     let response = tr.response().union(widget_response.unwrap());
+                    if banks && pointer.is_some_and(|p| response.rect.contains(p)) {
+                        hovered_row = Some(row.key.clone());
+                    }
                     if response.secondary_clicked() {
                         select_context_row(&mut self.selected, row);
                     }
@@ -2258,6 +2492,7 @@ impl App {
                     });
                 })
             });
+        self.drop_row = hovered_row;
         if let Some(row) = open {
             self.open_disk(ctx, row);
         }
@@ -2272,6 +2507,7 @@ impl App {
         let mut open = true;
         let mut execute = false;
         let mut browse = None;
+        let mut prepare_load = false;
         egui::Window::new(&form.title)
             .id(egui::Id::new("operation-form"))
             .open(&mut open)
@@ -2292,9 +2528,22 @@ impl App {
                             visual::colors(ui.ctx()).amber,
                             "Review before changing data",
                         );
-                        for (label, value) in form.labels.iter().zip(&form.values) {
-                            ui.label(RichText::new(label).strong());
-                            ui.label(value);
+                        if form.summary.is_empty() {
+                            for (label, value) in form.labels.iter().zip(&form.values) {
+                                ui.label(RichText::new(label).strong());
+                                ui.label(value);
+                            }
+                        } else {
+                            let (last, lines) = form.summary.split_last().unwrap();
+                            for (i, line) in lines.iter().enumerate() {
+                                ui.label(if i == 0 {
+                                    RichText::new(line).strong()
+                                } else {
+                                    RichText::new(line)
+                                });
+                            }
+                            ui.add_space(4.);
+                            ui.label(RichText::new(last).color(visual::colors(ui.ctx()).muted));
                         }
                         ui.separator();
                         ui.horizontal(|ui| {
@@ -2305,9 +2554,11 @@ impl App {
                                 .add(
                                     egui::Button::new(
                                         RichText::new(if form.eject.is_some() {
-                                            "Eject and power off"
+                                            "Eject and power off".to_string()
+                                        } else if form.command == "gui-replace-bank" {
+                                            format!("Write to bank {:0>3}", form.values[2])
                                         } else {
-                                            "Confirm and run"
+                                            "Confirm and run".to_string()
                                         })
                                         .strong()
                                         .color(Color32::WHITE),
@@ -2419,6 +2670,8 @@ impl App {
                                 valid,
                                 egui::Button::new(if form.editor.is_some() {
                                     "Save changes"
+                                } else if form.command == "gui-replace-bank" {
+                                    "Continue…"
                                 } else if form.confirm {
                                     "Review changes…"
                                 } else if form.command == "create-fat12" {
@@ -2438,7 +2691,9 @@ impl App {
                             )
                             .clicked()
                         {
-                            if form.confirm {
+                            if form.command == "gui-replace-bank" {
+                                prepare_load = true;
+                            } else if form.confirm {
                                 form.review = true;
                             } else {
                                 execute = true;
@@ -2447,7 +2702,9 @@ impl App {
                     }
                 });
             });
-        if open {
+        if open && prepare_load {
+            self.reprepare_bank_load(ctx, form);
+        } else if open {
             self.form = Some(form);
         }
         if let Some((i, kind)) = browse {
@@ -2784,7 +3041,7 @@ fn disk_menu(
         }
         if row.bank.is_some() {
             ui.separator();
-            if menu_item(ui, "Replace bank with recovery…", true) {
+            if menu_item(ui, "Load image into bank…", true) {
                 action = Some(DiskAction::Replace);
             }
             if menu_item(ui, "Replace using expected original…", true) {
@@ -3082,6 +3339,144 @@ fn disk_snapshot(
     } else {
         Ok((row.path.clone(), None))
     }
+}
+/// Validate a "load image into bank" request and turn it into a short review.
+/// Problems are returned to the editable form with an actionable message.
+fn prepare_bank_load(mut form: Form, current: &DiskRow) -> Event {
+    match describe_bank_load(&form, current) {
+        Ok(summary) => {
+            form.summary = summary;
+            form.review = true;
+            Event::Prepared(form)
+        }
+        Err(error) => Event::FormFailed(form, error),
+    }
+}
+fn describe_bank_load(form: &Form, current: &DiskRow) -> Result<Vec<String>, String> {
+    let [target, profile, bank, image, recovery] = form.values.as_slice() else {
+        return Err("Incomplete bank form".into());
+    };
+    let bank: u16 = bank.parse().map_err(|_| "Invalid bank number")?;
+    let payload = bank_payload(profile)?;
+    let image = Path::new(image);
+    let name = image
+        .file_name()
+        .unwrap_or(image.as_os_str())
+        .to_string_lossy();
+    if !fs::metadata(image).is_ok_and(|m| m.is_file()) {
+        return Err(format!("{} is not a readable file", image.display()));
+    }
+    if recovery.trim().is_empty() || Path::new(recovery).exists() {
+        return Err(
+            "Choose a new file for the recovery copy; existing files are never overwritten".into(),
+        );
+    }
+    let temp = tempfile::tempdir().map_err(|e| e.to_string())?;
+    let raw = raw_for_bank(image, profile, temp.path())?;
+    let size = fs::metadata(&raw).map_err(|e| e.to_string())?.len();
+    if size != payload {
+        let hint = ["gotek1440", "gotek720"]
+            .into_iter()
+            .find(|p| p != profile && bank_payload(p) == Ok(size))
+            .map(|p| {
+                format!(" It fits the {p} layout; switch the bank profile if your USB uses it.")
+            })
+            .unwrap_or_else(|| " Choose a raw floppy image of exactly that size.".into());
+        return Err(format!(
+            "{name} is {} ({size} bytes), but a {profile} bank holds exactly {} ({payload} bytes).{hint}",
+            format_size(size),
+            format_size(payload),
+        ));
+    }
+    let label = crate::fat12::volume_label(&raw)
+        .ok()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty());
+    let converted = raw != image;
+    Ok(vec![
+        format!("Bank {bank:03} on {target}"),
+        format!("Currently: {} · {}", current.name, current.kind),
+        format!(
+            "New image: {name}{}{} · {}",
+            label.map(|l| format!(" (label {l})")).unwrap_or_default(),
+            if converted { " · converted from HFE" } else { "" },
+            format_size(size)
+        ),
+        format!("Recovery copy: {recovery}"),
+        "The current bank is saved first, then the new image is written and verified. Other banks are not touched; the USB must be unmounted.".into(),
+    ])
+}
+fn bank_payload(profile: &str) -> Result<u64, String> {
+    match profile {
+        "gotek1440" => Ok(1440 * 1024),
+        "gotek720" => Ok(720 * 1024),
+        _ => Err(format!("Unknown bank profile {profile}")),
+    }
+}
+/// Banks hold raw sectors; HFE images are decoded into `dir` first.
+fn raw_for_bank(image: &Path, profile: &str, dir: &Path) -> Result<PathBuf, String> {
+    if !image
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("hfe"))
+    {
+        return Ok(image.to_path_buf());
+    }
+    let geometry = if profile == "gotek720" {
+        "pc720"
+    } else {
+        "pc1440"
+    };
+    let raw = dir.join("converted-from-hfe.img");
+    crate::convert::to_raw(image, &raw, geometry)
+        .map_err(|e| format!("Could not convert the HFE image for this bank: {e}"))?;
+    Ok(raw)
+}
+/// A durable per-user folder, so recovery copies never need to be chosen by hand.
+fn recovery_dir() -> PathBuf {
+    let var = |name| {
+        std::env::var_os(name)
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+    };
+    let base = if cfg!(windows) {
+        var("APPDATA")
+    } else if cfg!(target_os = "macos") {
+        var("HOME").map(|h| h.join("Library/Application Support"))
+    } else {
+        var("XDG_DATA_HOME").or_else(|| var("HOME").map(|h| h.join(".local/share")))
+    };
+    base.unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
+        .join("RustGotek")
+        .join("recovery")
+}
+fn default_recovery_path(bank: u16) -> PathBuf {
+    new_image_path(
+        &recovery_dir(),
+        &format!("bank{bank:03}-before-{}", utc_timestamp()),
+    )
+}
+fn utc_timestamp() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let (days, rem) = ((secs / 86_400) as i64, secs % 86_400);
+    // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}{month:02}{day:02}-{:02}{:02}{:02}Z",
+        rem / 3600,
+        rem / 60 % 60,
+        rem % 60
+    )
 }
 fn toolbar_divider(ui: &mut egui::Ui) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(14., 64.), egui::Sense::hover());
@@ -3805,6 +4200,147 @@ mod tests {
         assert_eq!(app.form.as_ref().unwrap().values[2], "99");
     }
 
+    /// Drive background work to completion, including follow-up refreshes.
+    fn settle(app: &mut App, ctx: &egui::Context) {
+        for _ in 0..1000 {
+            app.receive(ctx);
+            if !app.busy {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("worker did not finish: {}", app.status);
+    }
+    fn labelled_disk(dir: &Path, kib: usize, label: &str) -> PathBuf {
+        let blank = dir.join(format!("blank{kib}.img"));
+        let disk = dir.join(format!("{label}.img"));
+        crate::fat12::create(&blank, kib).unwrap();
+        crate::fat12::set_label(&blank, label, &disk).unwrap();
+        disk
+    }
+
+    #[test]
+    fn dropped_image_loads_into_bank_after_one_review_with_automatic_recovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let device = temp.path().join("usb.bin");
+        crate::banks::create_layout(&device, "gotek720", 3, "minimum").unwrap();
+        let image = labelled_disk(temp.path(), 720, "GAME DISK");
+        let ctx = egui::Context::default();
+        visual::apply(&ctx);
+        let mut app = App::new(Some(device.to_string_lossy().into()), &ctx);
+        app.profile = "gotek720".into();
+        app.scan(&ctx);
+        settle(&mut app, &ctx);
+        assert_eq!(app.rows.len(), 3);
+        app.selected = BTreeSet::from(["bank:001".into()]);
+        let hovering = ctx.run(
+            egui::RawInput {
+                hovered_files: vec![egui::HoveredFile {
+                    path: Some(image.clone()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            |ctx| app.ui(ctx),
+        );
+        assert!(text_position(&hovering.shapes, "Load into bank 001 · FDISK001").is_some());
+        let _ = ctx.run(
+            egui::RawInput {
+                dropped_files: vec![egui::DroppedFile {
+                    path: Some(image.clone()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            |ctx| app.ui(ctx),
+        );
+        settle(&mut app, &ctx);
+        let form = app.form.as_mut().expect("drop should open the review");
+        assert!(
+            form.review,
+            "a valid drop goes straight to review: {}",
+            app.log
+        );
+        assert!(form.summary[0].starts_with("Bank 001"));
+        assert!(form.summary.iter().any(|l| l.contains("GAME DISK")));
+        assert!(form.values[4].contains("bank001-before-"));
+        let recovery = temp.path().join("recovery").join("bank001.img");
+        form.values[4] = recovery.to_string_lossy().into();
+        app.execute_form(&ctx);
+        settle(&mut app, &ctx);
+        assert!(!app.error, "{}", app.log);
+        let exported = |bank: u16| {
+            let out = temp
+                .path()
+                .join(format!("check{bank}-{}.img", app.log.len()));
+            crate::banks::export(&device, "gotek720", bank, &out).unwrap();
+            crate::fat12::volume_label(&out).unwrap()
+        };
+        assert_eq!(exported(1), "GAME DISK");
+        assert_eq!(exported(0), "FDISK000");
+        assert_eq!(exported(2), "FDISK002");
+        assert_eq!(crate::fat12::volume_label(&recovery).unwrap(), "FDISK001");
+    }
+
+    #[test]
+    fn bank_load_review_explains_size_mismatch_and_converts_hfe() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = app();
+        app.profile = "gotek720".into();
+        let row = editor_row(Path::new("unused-test-device"), Some(4));
+        app.replace_bank_form(&row);
+        let mut form = app.form.take().unwrap();
+        assert_eq!(form.title, "Load image into bank 004");
+        form.values[4] = temp.path().join("recovery.img").to_string_lossy().into();
+
+        form.values[3] = labelled_disk(temp.path(), 1440, "BIG")
+            .to_string_lossy()
+            .into();
+        let error = describe_bank_load(&form, &row).unwrap_err();
+        assert!(error.contains("fits the gotek1440 layout"), "{error}");
+
+        let raw = labelled_disk(temp.path(), 720, "FROM HFE");
+        let hfe = temp.path().join("disk.hfe");
+        crate::convert::to_hfe(&raw, &hfe, "pc720").unwrap();
+        form.values[3] = hfe.to_string_lossy().into();
+        let summary = describe_bank_load(&form, &row).unwrap();
+        assert!(
+            summary
+                .iter()
+                .any(|l| l.contains("converted from HFE") && l.contains("FROM HFE"))
+        );
+
+        fs::write(&form.values[4], b"keep").unwrap();
+        assert!(
+            describe_bank_load(&form, &row)
+                .unwrap_err()
+                .contains("never overwritten")
+        );
+    }
+
+    #[test]
+    fn drops_name_their_target_and_refuse_ambiguous_banks() {
+        let mut app = app();
+        assert!(app.drop_intent().unwrap_err().contains("Scan banks first"));
+        app.rows = (0..2)
+            .map(|n| DiskRow {
+                key: format!("bank:{n:03}"),
+                name: format!("FDISK{n:03}"),
+                kind: "FAT12".into(),
+                size: 737_280,
+                path: "unused-test-device".into(),
+                bank: Some(n),
+                directory: false,
+                recognized: true,
+            })
+            .collect();
+        assert!(app.drop_intent().unwrap_err().contains("select a bank"));
+        app.selected = BTreeSet::from(["bank:000".into()]);
+        assert_eq!(app.drop_intent().unwrap(), "Load into bank 000 · FDISK000");
+        app.drop_row = Some("bank:001".into());
+        assert_eq!(app.drop_intent().unwrap(), "Load into bank 001 · FDISK001");
+    }
+
     #[test]
     fn forms_preserve_literal_paths_and_reject_incomplete_values() {
         let op = OPS.iter().find(|o| o.command == "slot").unwrap();
@@ -4068,7 +4604,7 @@ mod tests {
             });
         });
         assert!(text_position(&output.shapes, "Export selected disks…").is_some());
-        assert!(text_position(&output.shapes, "Replace bank with recovery…").is_none());
+        assert!(text_position(&output.shapes, "Load image into bank…").is_none());
     }
     #[test]
     fn operating_system_close_waits_for_active_operation() {
