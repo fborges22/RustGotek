@@ -673,6 +673,8 @@ struct App {
     root: String,
     source: String,
     profile: String,
+    /// USB disks found by the last detection: `(path, description)`.
+    detected: Vec<(String, String)>,
     listing: Option<Listing>,
     bank_catalog: Option<crate::banks::Catalog>,
     bank_identity: Option<(String, String)>,
@@ -711,11 +713,18 @@ impl App {
             source: bank_source.clone().unwrap_or_else(|| {
                 if cfg!(target_os = "linux") {
                     "/dev/sda".into()
+                } else if cfg!(windows) {
+                    crate::usb::detect()
+                        .into_iter()
+                        .next()
+                        .map(|(path, _)| path)
+                        .unwrap_or_default()
                 } else {
                     String::new()
                 }
             }),
             profile: "gotek1440".into(),
+            detected: vec![],
             listing: None,
             bank_catalog: None,
             bank_identity: None,
@@ -1816,7 +1825,11 @@ impl App {
             let response = if banks {
                 ui.add(
                     egui::TextEdit::singleline(&mut self.source)
-                        .hint_text("/dev/sda or a whole-device image")
+                        .hint_text(if cfg!(windows) {
+                            r"\\.\PhysicalDrive1, E: or a whole-device image"
+                        } else {
+                            "/dev/sda or a whole-device image"
+                        })
                         .desired_width(width),
                 )
             } else {
@@ -1837,6 +1850,31 @@ impl App {
                 self.choose_source(ctx);
             }
             if banks {
+                let menu = ui.menu_button("Detect USB ▾", |ui| {
+                    if self.detected.is_empty() {
+                        ui.label("No USB disks detected. Check that the drive is plugged in.");
+                    }
+                    let mut chosen = None;
+                    for (path, label) in &self.detected {
+                        if ui.button(label).clicked() {
+                            chosen = Some(path.clone());
+                        }
+                    }
+                    if let Some(path) = chosen {
+                        self.source = path;
+                        self.clear();
+                        self.status = "Ready to scan".into();
+                        ui.close();
+                    }
+                    if ui.button("Search again").clicked() {
+                        self.detected = crate::usb::detect();
+                    }
+                });
+                if menu.response.clicked() {
+                    self.detected = crate::usb::detect();
+                }
+                menu.response
+                    .on_hover_text("List connected USB disks to use as the bank source");
                 let old = self.profile.clone();
                 egui::ComboBox::from_id_salt("bank-profile")
                     .width(120.)
@@ -3758,6 +3796,10 @@ fn discover_media() -> Option<PathBuf> {
         .map(PathBuf::from)
         .filter(|p| p.is_dir())
     {
+        return Some(path);
+    }
+    #[cfg(windows)]
+    if let Some(path) = crate::windev::media_roots().into_iter().next() {
         return Some(path);
     }
     let user = std::env::var("USER").unwrap_or_default();

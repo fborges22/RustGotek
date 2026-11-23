@@ -8,6 +8,8 @@ mod hfe;
 mod media;
 mod slots;
 mod usb;
+#[cfg(windows)]
+mod windev;
 
 use std::{
     env, fs,
@@ -23,6 +25,7 @@ const HELP: &str = "rustgotek — manage mounted Gotek USB media
 Commands:
   gui                              Open the desktop interface (also the default)
   gui banks [SOURCE]               Open Disk banks, optionally prefill the source
+  usb-list                         List connected USB disks usable as a bank source
   usb-eject SOURCE --confirm-eject Unmount and power off a USB drive (Linux)
   bank-list SOURCE PROFILE         Inspect fixed-stride bank boot headers
   bank-create OUT PROFILE COUNT CAPACITY_BYTES|minimum
@@ -289,6 +292,15 @@ fn run(a: &[String]) -> Result<()> {
             let plan = usb::prepare(Path::new(source))?;
             usb::power_off(&plan)?;
             println!("USB powered off. Safe to unplug.");
+        }
+        ["usb-list"] => {
+            let found = usb::detect();
+            if found.is_empty() {
+                println!("No USB disks detected.");
+            }
+            for (_, label) in found {
+                println!("{label}");
+            }
         }
         ["bank-list", source, profile] => banks::list(Path::new(source), profile)?,
         ["bank-create", dest, profile, count, capacity] => {

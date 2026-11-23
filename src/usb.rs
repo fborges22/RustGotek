@@ -101,6 +101,41 @@ fn make_plan(number: u64, drives: &[Drive], volumes: &[Volume]) -> Result<Plan> 
     })
 }
 
+/// Connected USB disks usable as a bank source: `(path, description)`.
+pub fn detect() -> Vec<(String, String)> {
+    #[cfg(windows)]
+    {
+        crate::windev::usb_disks()
+            .into_iter()
+            .map(|d| (d.path.clone(), d.label()))
+            .collect()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let mut found: Vec<(String, String)> = std::fs::read_dir("/dev/disk/by-id")
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if !name.starts_with("usb-") || name.contains("-part") {
+                    return None;
+                }
+                let device = std::fs::canonicalize(entry.path()).ok()?;
+                let device = device.to_string_lossy().into_owned();
+                Some((device.clone(), format!("{device} — {name}")))
+            })
+            .collect();
+        found.sort();
+        found.dedup_by(|a, b| a.0 == b.0);
+        found
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        Vec::new()
+    }
+}
+
 pub fn prepare(source: &Path) -> Result<Plan> {
     #[cfg(target_os = "linux")]
     {

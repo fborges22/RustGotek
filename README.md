@@ -60,6 +60,15 @@ for changes. If the desktop reports no preference, System uses the light theme.
 - **Gotek USB banks:** enter a raw device such as `/dev/sda` or choose a whole-device
   backup, select the bank profile, and click **Scan banks**. Select banks to export
   them individually or in batches.
+  **Detect USB** lists connected USB disks to choose from (`rustgotek usb-list`
+  prints the same list).
+- **Windows:** USB drives are found by bus type, so flash drives that Windows
+  reports as fixed disks and Gotek media with no drive letter are still detected.
+  Bank sources are `\\.\PhysicalDriveN`, or a drive letter such as `E:`, which
+  selects the whole disk behind it. Reading raw devices needs RustGotek to run as
+  administrator. Writing banks directly to a raw device is not yet supported on
+  Windows; scanning, exporting and whole-device backups work. The image library
+  opens the first USB drive letter automatically.
 - **Load a floppy image into a bank:** drag an image file from your file manager
   and drop it onto a bank row, or select a bank and click **Load image**. A short
   review names the bank, its current disk and the new image (label and size) —

@@ -47,6 +47,10 @@ fn supported_source(meta: &fs::Metadata) -> bool {
     false
 }
 fn open_source(path: &Path) -> Result<(File, u64)> {
+    #[cfg(windows)]
+    if crate::windev::is_device(path) {
+        return crate::windev::open_read(path);
+    }
     if !supported_source(&fs::metadata(path)?) {
         return Err("source must be a regular whole-device image or readable block device".into());
     }
@@ -384,6 +388,10 @@ fn read_floppy(path: &Path, length: u64) -> Result<Vec<u8>> {
 }
 
 fn open_write_target(path: &Path) -> Result<File> {
+    #[cfg(windows)]
+    if crate::windev::is_device(path) {
+        return Err("writing raw USB devices is not supported on Windows yet; reading, exporting and backups work. Write banks from Linux or into a whole-device backup image".into());
+    }
     let metadata = fs::metadata(path)?;
     if metadata.is_file() {
         let file = OpenOptions::new().read(true).write(true).open(path)?;
