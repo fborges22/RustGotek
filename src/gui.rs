@@ -35,6 +35,10 @@ pub fn launch(bank_source: Option<String>) -> eframe::Result {
                 .map(|s| visual::Appearance::parse(&s))
                 .unwrap_or_default();
             cc.egui_ctx.set_theme(app.appearance.preference());
+            app.save_recovery = cc
+                .storage
+                .and_then(|s| s.get_string("recovery"))
+                .is_none_or(|v| v != "false");
             Ok(Box::new(app))
         }),
     )
@@ -102,7 +106,7 @@ static OPS: &[Operation] = &[
         Banks,
         "Inspect bank headers",
         "bank-list",
-        "Choose a raw device (for example /dev/sda) or a whole-device backup. gotek1440 uses 1536 KiB spacing; gotek720 uses 1024 KiB. Confirm the layout for your model. Linux may request read authorization in a system dialog. Header matches are not filesystem validation.",
+        "Choose a raw device (for example /dev/sda) or a whole-device backup. gotek1440 uses 1536 KiB spacing; gotek720 uses 1024 KiB. Confirm the layout for your model. Linux may request read authorization in a system dialog; Windows needs administrator rights. Header matches are not filesystem validation.",
         false,
         false,
         false,
@@ -172,7 +176,7 @@ static OPS: &[Operation] = &[
         Banks,
         "Write a replacement to a bank",
         "bank-write",
-        "Replace one bank on an unmounted Linux device or image file. First export the selected bank as the expected original. A new recovery image is saved before writing. Confirm the target, profile and bank below; Linux may also request authorization. Power loss can interrupt recovery.",
+        "Replace one bank on a USB device (unmounted on Linux; locked automatically on Windows) or image file. First export the selected bank as the expected original. A new recovery image is saved before writing. Confirm the target, profile and bank below; Linux may request authorization and Windows needs administrator rights. Power loss can interrupt recovery.",
         false,
         false,
         true,
@@ -189,7 +193,7 @@ static OPS: &[Operation] = &[
         Banks,
         "Restore a whole-device image",
         "device-restore",
-        "Replace every byte of an unmounted Linux device or existing image file. The replacement and expected original backups must exactly match its capacity. Save a new full recovery copy before writing; allow space for the entire device. Confirm all paths before proceeding.",
+        "Replace every byte of a USB device (unmounted on Linux; locked automatically on Windows) or existing image file. The replacement and expected original backups must exactly match its capacity. Save a new full recovery copy before writing; allow space for the entire device. Confirm all paths before proceeding.",
         false,
         false,
         true,
@@ -597,6 +601,8 @@ struct Form {
     eject: Option<crate::usb::Plan>,
     /// Plain-language review lines shown instead of the raw field list.
     summary: Vec<String>,
+    /// Save a recovery copy before writing (forms with recovery fields only).
+    recovery: bool,
 }
 impl Form {
     fn operation(op: &Operation) -> Self {
@@ -616,6 +622,7 @@ impl Form {
             batch: None,
             eject: None,
             summary: vec![],
+            recovery: true,
         }
     }
     fn bind_editor(&mut self, preview: &Preview) {
@@ -633,12 +640,34 @@ impl Form {
         self.keepalive = preview.temp.clone();
         self.editor = Some(preview.clone());
     }
+    /// Indices of the optional recovery-copy fields of this form.
+    fn recovery_fields(&self) -> &'static [usize] {
+        match self.command.as_str() {
+            "gui-replace-bank" | "bank-format" => &[4],
+            "bank-write" => &[5],
+            "bank-swap" => &[4, 5],
+            "image-format" => &[2],
+            _ => &[],
+        }
+    }
+    /// Field values as submitted: skipped recovery copies become `-`.
+    fn effective_values(&self) -> Vec<String> {
+        let mut values = self.values.clone();
+        if !self.recovery {
+            for &i in self.recovery_fields() {
+                if let Some(value) = values.get_mut(i) {
+                    *value = "-".into();
+                }
+            }
+        }
+        values
+    }
     fn args(&self, root: &str) -> Result<Vec<String>, String> {
         if self.media && root.is_empty() {
             return Err("Open a media folder first".into());
         }
-        if self.values.len() != self.labels.len() || self.values.iter().any(|s| s.trim().is_empty())
-        {
+        let values = self.effective_values();
+        if values.len() != self.labels.len() || values.iter().any(|s| s.trim().is_empty()) {
             return Err("Complete all fields before continuing".into());
         }
         match self.command.as_str() {
@@ -678,7 +707,7 @@ impl Form {
         if self.media {
             args.push(root.into());
         }
-        args.extend(self.values.clone());
+        args.extend(values);
         if matches!(
             self.command.as_str(),
             "bank-write" | "device-restore" | "bank-swap" | "bank-format" | "image-format"
@@ -704,6 +733,8 @@ enum Event {
 }
 struct App {
     appearance: visual::Appearance,
+    /// Remembered choice: save a recovery copy before bank/disk writes.
+    save_recovery: bool,
     workspace: Workspace,
     root: String,
     source: String,
@@ -739,6 +770,7 @@ impl App {
             .unwrap_or_default();
         let mut app = Self {
             appearance: visual::Appearance::System,
+            save_recovery: true,
             workspace: if bank_source.is_some() {
                 Workspace::Banks
             } else {
@@ -1038,6 +1070,7 @@ impl App {
         if let Some(op) = OPS.iter().find(|o| o.command == command) {
             self.error = false;
             let mut form = Form::operation(op);
+            form.recovery = self.save_recovery;
             let selected = self.selection();
             if command == "device-restore" {
                 form.values[0] = self.source.clone();
@@ -1265,6 +1298,7 @@ impl App {
             batch: None,
             eject: None,
             summary: vec![],
+            recovery: self.save_recovery,
         });
     }
     fn execute_form(&mut self, ctx: &egui::Context) {
@@ -1411,6 +1445,7 @@ impl App {
 impl eframe::App for App {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         storage.set_string("appearance", self.appearance.name().into());
+        storage.set_string("recovery", self.save_recovery.to_string());
     }
     fn persist_egui_memory(&self) -> bool {
         false
@@ -1996,6 +2031,27 @@ impl App {
                 self.refresh(ctx);
             }
         }
+        #[cfg(windows)]
+        if banks && !crate::windev::is_elevated() {
+            ui.horizontal_wrapped(|ui| {
+                visual::badge(
+                    ui,
+                    "NOT ADMINISTRATOR",
+                    visual::colors(ui.ctx()).amber,
+                    visual::colors(ui.ctx()).amber_fill,
+                );
+                ui.label(
+                    RichText::new(
+                        "Windows only allows reading and writing USB banks as administrator.",
+                    )
+                    .size(12.)
+                    .color(visual::colors(ui.ctx()).muted),
+                );
+                if visual::small_button(ui, Icon::Refresh, "Restart as administrator").clicked() {
+                    self.restart_elevated(ctx);
+                }
+            });
+        }
         if let Some(listing) = &self.listing {
             let root = listing.root.clone();
             let dir = listing.directory.clone();
@@ -2245,6 +2301,21 @@ impl App {
             egui::Popup::menu(&device).show(|ui| self.device_menu(ui, ctx));
         });
     }
+    /// Reopen RustGotek with administrator rights (Windows raw USB access).
+    #[cfg(windows)]
+    fn restart_elevated(&mut self, ctx: &egui::Context) {
+        let args: Vec<String> = if self.workspace == Workspace::Banks {
+            vec!["gui".into(), "banks".into(), self.source.clone()]
+        } else {
+            vec!["gui".into()]
+        };
+        if crate::windev::relaunch_elevated(&args) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        } else {
+            self.error = true;
+            self.status = "Administrator restart was cancelled".into();
+        }
+    }
     fn source_is_file(&self) -> bool {
         self.workspace == Workspace::Banks && Path::new(&self.source).is_file()
     }
@@ -2288,7 +2359,7 @@ impl App {
         if menu_item(
             ui,
             "Safely eject USB…",
-            cfg!(target_os = "linux") && !source.trim().is_empty(),
+            cfg!(any(target_os = "linux", windows)) && !source.trim().is_empty(),
         ) {
             let source = PathBuf::from(source);
             self.worker(ctx, "Identifying USB drive…", move || {
@@ -2338,6 +2409,13 @@ impl App {
         }
         ui.separator();
         ui.menu_button("Firmware", |ui| self.category_menu(ui, Page::Firmware));
+        #[cfg(windows)]
+        if !crate::windev::is_elevated() {
+            ui.separator();
+            if menu_item(ui, "Restart as administrator", !self.busy) {
+                self.restart_elevated(ctx);
+            }
+        }
     }
     fn category_menu(&mut self, ui: &mut egui::Ui, page: Page) {
         for op in OPS.iter().filter(|o| o.page == page) {
@@ -2374,6 +2452,7 @@ impl App {
             batch: None,
             eject: None,
             summary: vec![],
+            recovery: true,
         });
     }
     fn custom_form(
@@ -2400,6 +2479,7 @@ impl App {
             batch: None,
             eject: None,
             summary: vec![],
+            recovery: self.save_recovery,
         }
     }
     /// Swap two banks (Gotek USB) or two indexed slots (image library).
@@ -2504,13 +2584,18 @@ impl App {
     /// Plain-language review lines for swap and format confirmations.
     fn review_summary(&self, form: &Form) -> Vec<String> {
         let v = &form.values;
+        let none = "Recovery copy: not saved — the current contents cannot be restored afterwards";
         match form.command.as_str() {
             "bank-swap" => vec![
                 format!("Swap banks {:0>3} and {:0>3} on {}", v[2].trim(), v[3].trim(), v[0]),
                 format!("Bank {:0>3} now: {}", v[2].trim(), self.bank_name(&v[2])),
                 format!("Bank {:0>3} now: {}", v[3].trim(), self.bank_name(&v[3])),
-                format!("Recovery copies: {} and {}", v[4], v[5]),
-                "Both banks are saved first, then written and verified. If a write fails, both banks are restored. Other banks are not touched.".into(),
+                if form.recovery {
+                    format!("Recovery copies: {} and {}", v[4], v[5])
+                } else {
+                    none.replace("copy", "copies")
+                },
+                "Each bank is written and verified. If a write fails, both banks are restored. Other banks are not touched.".into(),
             ],
             "bank-format" => vec![
                 format!("Erase bank {:0>3} on {}", v[2].trim(), v[0]),
@@ -2520,8 +2605,17 @@ impl App {
                     if v[1] == "gotek720" { "720 KB" } else { "1.44 MB" },
                     v[3].trim().to_ascii_uppercase()
                 ),
-                format!("Recovery copy: {}", v[4]),
-                "Everything on this bank is erased. The recovery copy lets you load the old disk back with Load image.".into(),
+                if form.recovery {
+                    format!("Recovery copy: {}", v[4])
+                } else {
+                    none.into()
+                },
+                if form.recovery {
+                    "Everything on this bank is erased. The recovery copy lets you load the old disk back with Load image."
+                } else {
+                    "Everything on this bank is erased permanently."
+                }
+                .into(),
             ],
             "image-format" => {
                 let size = fs::metadata(&v[0]).map(|m| m.len()).unwrap_or(0);
@@ -2534,7 +2628,11 @@ impl App {
                         ),
                         None => format!("Warning: {} is not a standard floppy size; formatting will be refused", format_size(size)),
                     },
-                    format!("Recovery copy: {}", v[2]),
+                    if form.recovery {
+                        format!("Recovery copy: {}", v[2])
+                    } else {
+                        none.into()
+                    },
                     "Every file on this disk is erased. The image keeps its name and capacity.".into(),
                 ]
             }
@@ -2847,6 +2945,7 @@ impl App {
         let mut execute = false;
         let mut browse = None;
         let mut prepare_load = false;
+        let mut save_recovery = None;
         egui::Window::new(&form.title)
             .id(egui::Id::new("operation-form"))
             .open(&mut open)
@@ -2868,9 +2967,9 @@ impl App {
                             "Review before changing data",
                         );
                         if form.summary.is_empty() {
-                            for (label, value) in form.labels.iter().zip(&form.values) {
+                            for (label, value) in form.labels.iter().zip(form.effective_values()) {
                                 ui.label(RichText::new(label).strong());
-                                ui.label(value);
+                                ui.label(if value == "-" { "Not saved".into() } else { value });
                             }
                         } else {
                             let (last, lines) = form.summary.split_last().unwrap();
@@ -2883,6 +2982,21 @@ impl App {
                             }
                             ui.add_space(4.);
                             ui.label(RichText::new(last).color(visual::colors(ui.ctx()).muted));
+                        }
+                        if !form.recovery_fields().is_empty() {
+                            ui.add_space(4.);
+                            if ui
+                                .checkbox(&mut form.recovery, "Save a recovery copy first")
+                                .on_hover_text("Keep the current contents as an image file so this change can be undone")
+                                .changed()
+                            {
+                                save_recovery = Some(form.recovery);
+                                if form.command == "gui-replace-bank" {
+                                    prepare_load = true;
+                                } else {
+                                    form.summary = self.review_summary(&form);
+                                }
+                            }
                         }
                         ui.separator();
                         ui.horizontal(|ui| {
@@ -2932,8 +3046,26 @@ impl App {
                                         ui.label(edit.description());
                                     }
                                 }
+                                if !form.recovery_fields().is_empty() && form.batch.is_none() {
+                                    if ui
+                                        .checkbox(&mut form.recovery, "Save a recovery copy first")
+                                        .on_hover_text("Keep the current contents as an image file so this change can be undone")
+                                        .changed()
+                                    {
+                                        save_recovery = Some(form.recovery);
+                                    }
+                                    if !form.recovery {
+                                        ui.colored_label(
+                                            visual::colors(ui.ctx()).amber,
+                                            "Without a recovery copy, the current contents cannot be restored after this change.",
+                                        );
+                                    }
+                                }
                                 for i in 0..form.values.len() {
                                     if form.batch.is_some() {
+                                        continue;
+                                    }
+                                    if !form.recovery && form.recovery_fields().contains(&i) {
                                         continue;
                                     }
                                     if form.editor.is_some()
@@ -3058,6 +3190,9 @@ impl App {
                     }
                 });
             });
+        if let Some(choice) = save_recovery {
+            self.save_recovery = choice;
+        }
         if open && prepare_load {
             self.reprepare_bank_load(ctx, form);
         } else if open {
@@ -3766,7 +3901,7 @@ fn describe_bank_load(form: &Form, current: &DiskRow) -> Result<Vec<String>, Str
     if !fs::metadata(image).is_ok_and(|m| m.is_file()) {
         return Err(format!("{} is not a readable file", image.display()));
     }
-    if recovery.trim().is_empty() || Path::new(recovery).exists() {
+    if form.recovery && (recovery.trim().is_empty() || Path::new(recovery).exists()) {
         return Err(
             "Choose a new file for the recovery copy; existing files are never overwritten".into(),
         );
@@ -3802,8 +3937,17 @@ fn describe_bank_load(form: &Form, current: &DiskRow) -> Result<Vec<String>, Str
             if converted { " · converted from HFE" } else { "" },
             format_size(size)
         ),
-        format!("Recovery copy: {recovery}"),
-        "The current bank is saved first, then the new image is written and verified. Other banks are not touched; the USB must be unmounted.".into(),
+        if form.recovery {
+            format!("Recovery copy: {recovery}")
+        } else {
+            "Recovery copy: not saved — the current disk cannot be restored afterwards".into()
+        },
+        if form.recovery {
+            "The current bank is saved first, then the new image is written and verified. Other banks are not touched; the USB must be unmounted."
+        } else {
+            "The new image is written and verified. Other banks are not touched; the USB must be unmounted."
+        }
+        .into(),
     ])
 }
 fn bank_payload(profile: &str) -> Result<u64, String> {
@@ -4023,9 +4167,12 @@ fn backend(args: Vec<String>) -> Result<String, String> {
                     bank.parse()?,
                     Path::new(image),
                     Path::new(expected),
-                    Path::new(recovery),
+                    crate::optional_path(recovery),
                 )?;
-                format!("Bank {bank} written and verified. Recovery image: {recovery}")
+                format!(
+                    "Bank {bank} written and verified. {}",
+                    recovery_message(&[recovery])
+                )
             }
             [
                 "bank-swap",
@@ -4042,11 +4189,11 @@ fn backend(args: Vec<String>) -> Result<String, String> {
                     profile,
                     a.parse()?,
                     b.parse()?,
-                    Path::new(recovery_a),
-                    Path::new(recovery_b),
+                    crate::optional_path(recovery_a).zip(crate::optional_path(recovery_b)),
                 )?;
                 format!(
-                    "Banks {a:0>3} and {b:0>3} swapped and verified. Recovery images: {recovery_a} and {recovery_b}"
+                    "Banks {a:0>3} and {b:0>3} swapped and verified. {}",
+                    recovery_message(&[recovery_a, recovery_b])
                 )
             }
             [
@@ -4063,17 +4210,23 @@ fn backend(args: Vec<String>) -> Result<String, String> {
                     profile,
                     bank.parse()?,
                     if *label == "-" { "" } else { label },
-                    Path::new(recovery),
+                    crate::optional_path(recovery),
                 )?;
-                format!("Bank {bank:0>3} formatted and verified. Recovery image: {recovery}")
+                format!(
+                    "Bank {bank:0>3} formatted and verified. {}",
+                    recovery_message(&[recovery])
+                )
             }
             ["image-format", image, label, recovery, "--confirm-write"] => {
                 crate::banks::format_image(
                     Path::new(image),
                     if *label == "-" { "" } else { label },
-                    Path::new(recovery),
+                    crate::optional_path(recovery),
                 )?;
-                format!("{image} formatted and verified. Recovery image: {recovery}")
+                format!(
+                    "{image} formatted and verified. {}",
+                    recovery_message(&[recovery])
+                )
             }
             [
                 "device-restore",
@@ -4129,6 +4282,14 @@ fn backend(args: Vec<String>) -> Result<String, String> {
         } else {
             text
         })
+    }
+}
+fn recovery_message(paths: &[&str]) -> String {
+    let saved: Vec<_> = paths.iter().filter(|p| **p != "-").copied().collect();
+    if saved.is_empty() {
+        "No recovery image was saved.".into()
+    } else {
+        format!("Recovery image: {}", saved.join(" and "))
     }
 }
 fn read_listing(root: &Path, directory: &Path) -> Result<Listing, String> {
@@ -5103,8 +5264,23 @@ mod tests {
         let output = render(&mut app, &ctx, vec![]);
         assert!(text_position(&output.shapes, "Swap banks 004 and 009").is_some());
 
+        // Turning recovery off submits "-" and needs no recovery path.
+        let mut skip = app.form.clone().unwrap();
+        skip.recovery = false;
+        skip.values[4].clear();
+        skip.values[5].clear();
+        let args = skip.args("").unwrap();
+        assert_eq!((args[5].as_str(), args[6].as_str()), ("-", "-"));
+        assert!(app.review_summary(&skip)[3].contains("not saved"));
+        app.save_recovery = false;
+        app.form = None;
         let row = app.rows[0].clone();
         app.format_form(&row);
+        assert!(
+            !app.form.as_ref().unwrap().recovery,
+            "the remembered choice applies to new forms"
+        );
+        app.save_recovery = true;
         let form = app.form.as_ref().unwrap();
         assert_eq!(form.command, "bank-format");
         assert_eq!(form.values[3], "FDISK004");

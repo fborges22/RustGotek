@@ -1,5 +1,5 @@
 //! Original-firmware fixed-stride banks. Profiles are explicit, never guessed
-//! from the first FAT volume. Writes require an explicit confirmation, an expected original and recovery file.
+//! from the first FAT volume. Writes require an explicit confirmation and an expected original; bank recovery files are optional.
 use crate::Result;
 use std::{
     fs::{self, File, OpenOptions},
@@ -178,7 +178,7 @@ fn new_output(path: &Path, write: impl FnOnce(&mut File) -> Result<()>) -> Resul
     }
     result
 }
-fn copy_exact(source: &mut File, output: &mut File, length: u64) -> Result<()> {
+fn copy_exact(source: &mut impl Read, output: &mut File, length: u64) -> Result<()> {
     let copied = io::copy(&mut source.take(length), output)?;
     if copied != length {
         return Err("source became shorter during the copy; incomplete output removed".into());
@@ -387,11 +387,17 @@ fn read_floppy(path: &Path, length: u64) -> Result<Vec<u8>> {
     Ok(data)
 }
 
-fn open_write_target(path: &Path) -> Result<File> {
+/// Opens a write target: an image file, an unmounted Linux block device, or
+/// (on Windows) a USB disk whose volumes are locked for the duration.
+fn open_write_target(path: &Path) -> Result<Box<dyn BankIo>> {
     #[cfg(windows)]
     if crate::windev::is_device(path) {
-        return Err("writing raw USB devices is not supported on Windows yet; reading, exporting and backups work. Write banks from Linux or into a whole-device backup image".into());
+        return Ok(Box::new(crate::windev::open_write(path)?));
     }
+    open_write_file(path).map(|f| Box::new(f) as Box<dyn BankIo>)
+}
+
+fn open_write_file(path: &Path) -> Result<File> {
     let metadata = fs::metadata(path)?;
     if metadata.is_file() {
         let file = OpenOptions::new().read(true).write(true).open(path)?;
@@ -431,7 +437,7 @@ fn open_write_target(path: &Path) -> Result<File> {
             return Ok(file);
         }
     }
-    Err("write target must be a regular image file or an unmounted Linux block device".into())
+    Err("write target must be a regular image file, an unmounted Linux block device or a Windows USB disk".into())
 }
 
 trait BankIo: Read + Write + Seek {
@@ -440,6 +446,17 @@ trait BankIo: Read + Write + Seek {
 impl BankIo for File {
     fn sync_bank(&mut self) -> io::Result<()> {
         self.sync_all()
+    }
+}
+impl BankIo for Box<dyn BankIo> {
+    fn sync_bank(&mut self) -> io::Result<()> {
+        (**self).sync_bank()
+    }
+}
+#[cfg(windows)]
+impl BankIo for crate::windev::DeviceWriter {
+    fn sync_bank(&mut self) -> io::Result<()> {
+        self.sync()
     }
 }
 fn read_bank(target: &mut (impl Read + Seek), offset: u64, length: usize) -> io::Result<Vec<u8>> {
@@ -543,7 +560,7 @@ pub fn write_bank(
     bank: u16,
     image: &Path,
     expected: &Path,
-    recovery: &Path,
+    recovery: Option<&Path>,
 ) -> Result<()> {
     let layout = Profile::parse(profile)?;
     // Reject invalid bank numbers and inputs before requesting device access.
@@ -564,33 +581,35 @@ pub fn write_bank(
         return Ok(());
     }
     // Persist and re-read the recovery copy before the first target write.
-    new_output(recovery, |file| {
-        file.write_all(&original)?;
-        Ok(())
-    })?;
-    #[cfg(unix)]
-    File::open(
-        recovery
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(Path::new(".")),
-    )?
-    .sync_all()?;
-    if read_floppy(recovery, layout.payload)? != original {
-        return Err("recovery verification failed; target unchanged".into());
-    }
-    // Recheck after saving recovery, in case a non-cooperating process wrote
-    // to a regular image despite the advisory lock.
-    if read_bank(&mut target_file, offset, original.len())? != original {
-        return Err("target bank changed while saving recovery; write cancelled".into());
+    if let Some(recovery) = recovery {
+        save_recovery(recovery, &original)?;
+        // Recheck after saving recovery, in case a non-cooperating process
+        // wrote to a regular image despite the advisory lock.
+        if read_bank(&mut target_file, offset, original.len())? != original {
+            return Err("target bank changed while saving recovery; write cancelled".into());
+        }
     }
     replace_with_recovery(&mut target_file, offset, &original, &replacement)?;
     println!(
-        "Wrote and verified bank {bank:03} at byte {offset} ({} bytes). Recovery: {}. Other banks and padding were not written.",
+        "Wrote and verified bank {bank:03} at byte {offset} ({} bytes). {} Other banks and padding were not written.",
         layout.payload,
-        recovery.display()
+        recovery_note(&[recovery])
     );
     Ok(())
+}
+
+/// How the saved recovery files (if any) are reported after a write.
+fn recovery_note(paths: &[Option<&Path>]) -> String {
+    let saved: Vec<_> = paths
+        .iter()
+        .flatten()
+        .map(|p| p.display().to_string())
+        .collect();
+    if saved.is_empty() {
+        "No recovery copy was saved.".into()
+    } else {
+        format!("Recovery: {}.", saved.join(" and "))
+    }
 }
 
 /// Save `data` to a new recovery file, sync it and read it back.
@@ -621,8 +640,7 @@ pub fn swap_banks(
     profile: &str,
     a: u16,
     b: u16,
-    recovery_a: &Path,
-    recovery_b: &Path,
+    recovery: Option<(&Path, &Path)>,
 ) -> Result<()> {
     let layout = Profile::parse(profile)?;
     layout.offset(a, u64::MAX)?;
@@ -630,7 +648,7 @@ pub fn swap_banks(
     if a == b {
         return Err("choose two different banks to swap".into());
     }
-    if recovery_a == recovery_b {
+    if recovery.is_some_and(|(x, y)| x == y) {
         return Err("each bank needs its own recovery file".into());
     }
     let mut file = open_write_target(target)?;
@@ -643,8 +661,10 @@ pub fn swap_banks(
         println!("Banks {a:03} and {b:03} are identical. Nothing to swap.");
         return Ok(());
     }
-    save_recovery(recovery_a, &first)?;
-    save_recovery(recovery_b, &second)?;
+    if let Some((recovery_a, recovery_b)) = recovery {
+        save_recovery(recovery_a, &first)?;
+        save_recovery(recovery_b, &second)?;
+    }
     if read_bank(&mut file, offset_a, length)? != first
         || read_bank(&mut file, offset_b, length)? != second
     {
@@ -655,18 +675,17 @@ pub fn swap_banks(
         let undo_b = write_verified(&mut file, offset_b, &second);
         let undo_a = write_verified(&mut file, offset_a, &first);
         return Err(match (undo_a, undo_b) {
-            (Ok(()), Ok(())) => format!("swap failed ({error}); both banks restored and verified; recovery files retained"),
+            (Ok(()), Ok(())) => format!("swap failed ({error}); both banks restored and verified"),
             (a_result, b_result) => format!(
-                "swap failed ({error}); automatic recovery also failed ({}). Retain both recovery files",
+                "swap failed ({error}); automatic recovery also failed ({}). Retain any recovery files",
                 [a_result.err(), b_result.err()].into_iter().flatten().map(|e| e.to_string()).collect::<Vec<_>>().join("; ")
             ),
         }
         .into());
     }
     println!(
-        "Swapped and verified banks {a:03} and {b:03}. Recovery: {} and {}. Other banks and padding were not written.",
-        recovery_a.display(),
-        recovery_b.display()
+        "Swapped and verified banks {a:03} and {b:03}. {} Other banks and padding were not written.",
+        recovery_note(&[recovery.map(|r| r.0), recovery.map(|r| r.1)])
     );
     Ok(())
 }
@@ -677,7 +696,7 @@ pub fn format_bank(
     profile: &str,
     bank: u16,
     label: &str,
-    recovery: &Path,
+    recovery: Option<&Path>,
 ) -> Result<()> {
     let layout = Profile::parse(profile)?;
     layout.offset(bank, u64::MAX)?;
@@ -686,25 +705,27 @@ pub fn format_bank(
     let size = file.seek(SeekFrom::End(0))?;
     let offset = layout.offset(bank, size)?;
     let original = read_bank(&mut file, offset, blank.len())?;
-    save_recovery(recovery, &original)?;
-    if read_bank(&mut file, offset, original.len())? != original {
-        return Err("target bank changed while saving recovery; format cancelled".into());
+    if let Some(recovery) = recovery {
+        save_recovery(recovery, &original)?;
+        if read_bank(&mut file, offset, original.len())? != original {
+            return Err("target bank changed while saving recovery; format cancelled".into());
+        }
     }
     replace_with_recovery(&mut file, offset, &original, &blank)?;
     println!(
-        "Formatted bank {bank:03} as a blank FAT12 disk{}. Recovery: {}. Other banks were not written.",
+        "Formatted bank {bank:03} as a blank FAT12 disk{}. {} Other banks were not written.",
         if label.trim().is_empty() {
             String::new()
         } else {
             format!(" labelled {}", label.trim().to_ascii_uppercase())
         },
-        recovery.display()
+        recovery_note(&[recovery])
     );
     Ok(())
 }
 
 /// Erase a standalone raw floppy image in place, keeping its capacity.
-pub fn format_image(target: &Path, label: &str, recovery: &Path) -> Result<()> {
+pub fn format_image(target: &Path, label: &str, recovery: Option<&Path>) -> Result<()> {
     if !fs::symlink_metadata(target)?.is_file() {
         return Err("only regular image files can be formatted".into());
     }
@@ -716,12 +737,14 @@ pub fn format_image(target: &Path, label: &str, recovery: &Path) -> Result<()> {
         )
     })?;
     let blank = crate::fat12::formatted_labelled(kib, label)?;
-    save_recovery(recovery, &original)?;
+    if let Some(recovery) = recovery {
+        save_recovery(recovery, &original)?;
+    }
     edit_disk(target, None, &original, &blank)?;
     println!(
-        "Formatted {} as a blank {kib} KiB FAT12 disk. Recovery: {}",
+        "Formatted {} as a blank {kib} KiB FAT12 disk. {}",
         target.display(),
-        recovery.display()
+        recovery_note(&[recovery])
     );
     Ok(())
 }

@@ -1782,3 +1782,53 @@ fn slot_swap_renames_both_images_and_moves_into_empty_slots() {
         .collect();
     assert_eq!(names.len(), 2, "{names:?}");
 }
+
+#[test]
+fn recovery_copies_are_optional_for_bank_and_disk_writes() {
+    let s = Sandbox::new();
+    s.ok(&["bank-create", "usb.bin", "gotek720", "2", "minimum"]);
+    let before = fs::read(s.0.join("usb.bin")).unwrap();
+    s.ok(&[
+        "bank-swap",
+        "usb.bin",
+        "gotek720",
+        "0",
+        "1",
+        "-",
+        "-",
+        "--confirm-write",
+    ]);
+    assert_ne!(fs::read(s.0.join("usb.bin")).unwrap(), before);
+    s.ok(&[
+        "bank-format",
+        "usb.bin",
+        "gotek720",
+        "0",
+        "EMPTY",
+        "-",
+        "--confirm-write",
+    ]);
+    s.ok(&["bank-export", "usb.bin", "gotek720", "1", "one.img"]);
+    s.ok(&["bank-export", "usb.bin", "gotek720", "0", "zero.img"]);
+    s.ok(&[
+        "bank-write",
+        "usb.bin",
+        "gotek720",
+        "1",
+        "zero.img",
+        "one.img",
+        "-",
+        "--confirm-write",
+    ]);
+    s.ok(&["create-fat12", "disk.img", "720"]);
+    let output = s.run(&["image-format", "disk.img", "-", "-", "--confirm-write"]);
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("No recovery copy"));
+    // Only the files created above exist: no recovery images were written.
+    let mut names: Vec<_> = fs::read_dir(&s.0)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["disk.img", "one.img", "usb.bin", "zero.img"]);
+}

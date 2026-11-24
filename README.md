@@ -65,10 +65,16 @@ for changes. If the desktop reports no preference, System uses the light theme.
 - **Windows:** USB drives are found by bus type, so flash drives that Windows
   reports as fixed disks and Gotek media with no drive letter are still detected.
   Bank sources are `\\.\PhysicalDriveN`, or a drive letter such as `E:`, which
-  selects the whole disk behind it. Reading raw devices needs RustGotek to run as
-  administrator. Writing banks directly to a raw device is not yet supported on
-  Windows; scanning, exporting and whole-device backups work. The image library
-  opens the first USB drive letter automatically.
+  selects the whole disk behind it. Raw USB access needs administrator rights:
+  the USB banks workspace shows **Restart as administrator** (also under
+  **Device**) when RustGotek is not elevated. Every action works on Windows,
+  including loading images into banks, swapping, formatting, editing disk
+  contents, whole-device restore and safe ejection. Before writing, RustGotek
+  locks and dismounts every volume on the USB (close File Explorer windows on
+  it first) and releases them afterwards so Windows sees the new contents.
+  Writes are sector-aligned and limited to USB/removable disks; the Windows
+  system disk is always refused. The image library opens the first USB drive
+  letter automatically.
 - **Load a floppy image into a bank:** drag an image file from your file manager
   and drop it onto a bank row, or select a bank and click **Load image**. A short
   review names the bank, its current disk and the new image (label and size) —
@@ -104,7 +110,7 @@ for changes. If the desktop reports no preference, System uses the light theme.
   Checks run directly on a selected disk; editing and conversion forms prefill
   its path. Bank actions automatically prepare a temporary floppy snapshot.
 
-On Linux, **Device → Safely eject USB…** identifies the USB behind the current
+On Linux and Windows, **Device → Safely eject USB…** identifies the USB behind the current
 raw-device source or mounted folder and shows all affected volumes for review.
 Click **Eject and power off** to unmount them and request safe power-off through
 UDisks2. Wait for **USB powered off — safe to unplug** before removing it.
@@ -112,7 +118,9 @@ Busy volumes stop the operation; close files using the drive and try again.
 A failed attempt may leave some volumes unmounted without powering off the USB.
 The action reuses system authorization and requests it when necessary. It rejects
 image files, non-USB drives and devices without power-off support. Other platforms
-should use their operating system's eject action. CLI equivalent:
+should use their operating system's eject action. On Windows the action locks
+and dismounts the USB's volumes and ejects its media (run as administrator).
+CLI equivalent:
 
 ```sh
 rustgotek usb-eject /dev/sda --confirm-eject
@@ -195,8 +203,9 @@ caller. Authorization is requested only when ordinary access is denied;
 expiration, a different authorization policy, or an OS session change can
 require another prompt. Read operations request a read-only device handle. The explicit bank-write
 and device-restore operations request exclusive read/write access. The GUI does not run as root
-or alter device permissions. Other systems can work with whole-device
-image files; raw Windows device paths are not supported yet.
+or alter device permissions. On Windows, run as administrator; volumes on the
+USB are locked and dismounted during writes. Other systems can work with
+whole-device image files.
 
 Profiles are explicit: `gotek1440` means 1440 KiB payloads at 1536 KiB intervals,
 and `gotek720` means 720 KiB payloads at 1024 KiB intervals. These are layout
@@ -227,7 +236,14 @@ rustgotek image-format ./disk.img - ./disk-before.img --confirm-write
 rustgotek slot-swap /media/USB 1 3
 ```
 
-`bank-swap` saves and verifies both originals before writing either bank.
+Recovery copies are optional. In the app, untick **Save a recovery copy first**
+in the form or on the review screen; the choice is remembered. On the command
+line, pass `-` instead of a recovery path to `bank-write`, `bank-swap`,
+`bank-format` or `image-format`. Without a copy, a failed write is still undone
+from memory, but a successful change cannot be reversed. `device-restore`
+always saves a full recovery file because it needs one to undo a failed restore.
+
+`bank-swap` saves and verifies both originals (when requested) before writing either bank.
 `bank-format` and `image-format` write a blank FAT12 disk (use `-` for no label)
 after saving the original. Recovery paths must be new files.
 

@@ -1,4 +1,5 @@
-//! Safe USB removal through UDisks, sharing the GUI's authorization identity.
+//! Safe USB removal: UDisks on Linux (sharing the GUI's authorization
+//! identity); volume lock, dismount and media eject on Windows.
 use crate::Result;
 use std::path::Path;
 
@@ -51,9 +52,15 @@ impl Plan {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        format!(
-            "Safely eject {names}\n{volumes}\nAll volumes on this USB device will be unmounted, then the device will be powered off. Close files open on it first."
-        )
+        if cfg!(windows) {
+            format!(
+                "Safely eject {names}\n{volumes}\nAll volumes on this USB disk will be locked and dismounted, then its media is ejected. Close File Explorer windows and files open on it first."
+            )
+        } else {
+            format!(
+                "Safely eject {names}\n{volumes}\nAll volumes on this USB device will be unmounted, then the device will be powered off. Close files open on it first."
+            )
+        }
     }
 }
 
@@ -151,13 +158,37 @@ pub fn prepare(source: &Path) -> Result<Plan> {
         let (drives, volumes) = linux::inventory()?;
         make_plan(number, &drives, &volumes)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
+    {
+        let (device, name, letters) = crate::windev::eject_plan(source)?;
+        Ok(Plan {
+            drive: device.clone(),
+            number: 0,
+            drives: vec![Drive {
+                path: device.clone(),
+                id: String::new(),
+                detected: 0,
+                name,
+                bus: "usb".into(),
+                sibling: String::new(),
+                can_power_off: true,
+            }],
+            volumes: letters
+                .into_iter()
+                .map(|l| Volume {
+                    path: format!("{l}:"),
+                    drive: device.clone(),
+                    number: 0,
+                    device: format!("{l}:"),
+                    mounts: vec![format!(r"{l}:\")],
+                })
+                .collect(),
+        })
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
     {
         let _ = source;
-        Err(
-            "USB power off currently requires Linux with UDisks2; use your system's eject action"
-                .into(),
-        )
+        Err("Safe ejection requires Linux or Windows; use your system's eject action".into())
     }
 }
 
@@ -183,10 +214,19 @@ pub fn power_off(plan: &Plan) -> Result<()> {
             linux::call(path, interface, method)
         })
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
+    {
+        // Re-identify the disk: a different USB may now use the same number.
+        let current = prepare(Path::new(&plan.drive))?;
+        if current.drives != plan.drives {
+            return Err("USB device changed; review Safely eject USB again".into());
+        }
+        crate::windev::eject(Path::new(&plan.drive)).map(|_| ())
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
     {
         let _ = plan;
-        Err("USB power off currently requires Linux with UDisks2".into())
+        Err("Safe ejection requires Linux or Windows".into())
     }
 }
 

@@ -78,8 +78,11 @@ Commands:
 
 ROOT must be an existing mounted directory. Bank SOURCE can be a readable block
 device or a whole-device image. Profiles: gotek1440, gotek720 (explicit layout).
-bank-write and device-restore require an unmounted Linux device or image file,
-an expected original image, a new recovery path and --confirm-write.
+bank-write and device-restore need an image file, an unmounted Linux device or
+a Windows USB disk (run as administrator; its volumes are locked automatically),
+an expected original image, a new recovery path and --confirm-write. For
+bank-write, bank-swap, bank-format and image-format, pass - as RECOVERY to skip
+the recovery copy (device-restore always needs one).
 create-fat12 supports 360, 720, 1200, 1440, and 2880 KiB image files.
 Copies refuse overwrites. remove is recoverable through export from the trash.
 Configuration values are firmware-dependent; consult your firmware manual.
@@ -341,7 +344,7 @@ fn run(a: &[String]) -> Result<()> {
             bank.parse()?,
             Path::new(image),
             Path::new(expected),
-            Path::new(recovery),
+            crate::optional_path(recovery),
         )?,
         [
             "bank-swap",
@@ -357,8 +360,7 @@ fn run(a: &[String]) -> Result<()> {
             profile,
             a.parse()?,
             b.parse()?,
-            Path::new(recovery_a),
-            Path::new(recovery_b),
+            crate::optional_path(recovery_a).zip(crate::optional_path(recovery_b)),
         )?,
         [
             "bank-format",
@@ -373,12 +375,12 @@ fn run(a: &[String]) -> Result<()> {
             profile,
             bank.parse()?,
             if *label == "-" { "" } else { label },
-            Path::new(recovery),
+            crate::optional_path(recovery),
         )?,
         ["image-format", path, label, recovery, "--confirm-write"] => banks::format_image(
             Path::new(path),
             if *label == "-" { "" } else { label },
-            Path::new(recovery),
+            crate::optional_path(recovery),
         )?,
         ["bank-export", source, profile, bank, out] => {
             banks::export(Path::new(source), profile, bank.parse()?, Path::new(out))?
@@ -545,4 +547,9 @@ fn main() {
         eprintln!("rustgotek: {e}");
         process::exit(1);
     }
+}
+
+/// A recovery path argument; `-` means "do not save a recovery copy".
+fn optional_path(value: &str) -> Option<&Path> {
+    (value != "-").then(|| Path::new(value))
 }
