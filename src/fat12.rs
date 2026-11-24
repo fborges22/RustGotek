@@ -69,6 +69,29 @@ pub fn formatted_image(kib: usize) -> Result<Vec<u8>> {
     Ok(data)
 }
 
+/// A blank FAT12 floppy whose boot record and root volume entry carry `label`.
+/// An empty label leaves the disk unlabelled ("NO NAME").
+pub fn formatted_labelled(kib: usize, label: &str) -> Result<Vec<u8>> {
+    let mut data = formatted_image(kib)?;
+    if label.trim().is_empty() {
+        return Ok(data);
+    }
+    let encoded = encode_label(label)?;
+    let root = (word(&data, 14) + data[16] as usize * word(&data, 22)) * 512;
+    data[43..54].copy_from_slice(&encoded);
+    data[root..root + 11].copy_from_slice(&encoded);
+    data[root + 11] = 0x08;
+    inspect(&data)?;
+    Ok(data)
+}
+
+/// Standard capacity (KiB) for a raw floppy of `bytes`, if it is one we can format.
+pub fn capacity_for(bytes: u64) -> Option<usize> {
+    [360, 720, 1200, 1440, 2880]
+        .into_iter()
+        .find(|kib| *kib as u64 * 1024 == bytes)
+}
+
 #[derive(Debug)]
 pub struct Layout {
     pub sectors: usize,

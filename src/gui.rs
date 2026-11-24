@@ -252,6 +252,19 @@ static OPS: &[Operation] = &[
         ]
     ),
     op!(
+        Slots,
+        "Swap two slots",
+        "slot-swap",
+        "Exchange two indexed images by renaming them in place; no data is copied. If one slot is empty, the image simply moves there.",
+        true,
+        true,
+        true,
+        [
+            field!("First slot", Text, "0"),
+            field!("Second slot", Text, "1")
+        ]
+    ),
+    op!(
         Images,
         "Create a PC floppy",
         "create-fat12",
@@ -640,6 +653,25 @@ impl Form {
                 }
                 crate::fat12::validate_short_name(name).map_err(|_| "Use a DOS name: up to 8 characters plus a 3-character extension, for example NOTES.TXT".to_string())?;
             }
+            "bank-format" | "image-format" => {
+                let label = &self.values[if self.command == "bank-format" { 3 } else { 1 }];
+                if label != "-" {
+                    crate::fat12::encode_label(label).map_err(|e| e.to_string())?;
+                }
+            }
+            "bank-swap" | "slot-swap" => {
+                let (a, b) = if self.command == "bank-swap" {
+                    (&self.values[2], &self.values[3])
+                } else {
+                    (&self.values[0], &self.values[1])
+                };
+                let parse = |v: &String| v.trim().parse::<u16>().ok().filter(|n| *n <= 999);
+                match (parse(a), parse(b)) {
+                    (Some(a), Some(b)) if a != b => {}
+                    (Some(_), Some(_)) => return Err("Choose two different numbers".into()),
+                    _ => return Err("Enter numbers from 0 to 999".into()),
+                }
+            }
             _ => {}
         }
         let mut args = vec![self.command.clone()];
@@ -647,7 +679,10 @@ impl Form {
             args.push(root.into());
         }
         args.extend(self.values.clone());
-        if matches!(self.command.as_str(), "bank-write" | "device-restore") {
+        if matches!(
+            self.command.as_str(),
+            "bank-write" | "device-restore" | "bank-swap" | "bank-format" | "image-format"
+        ) {
             args.push("--confirm-write".into());
         }
         Ok(args)
@@ -1321,6 +1356,23 @@ impl App {
                         "--confirm-write".into(),
                     ])?
                 } else {
+                    // Default recovery copies live in the per-user recovery folder.
+                    let recovery: &[usize] = match args[0].as_str() {
+                        "bank-swap" => &[5, 6],
+                        "bank-format" => &[5],
+                        "image-format" => &[3],
+                        _ => &[],
+                    };
+                    for parent in recovery
+                        .iter()
+                        .filter_map(|&i| Path::new(&args[i]).parent())
+                    {
+                        if !parent.as_os_str().is_empty() {
+                            fs::create_dir_all(parent).map_err(|e| {
+                                format!("Cannot create recovery folder {}: {e}", parent.display())
+                            })?;
+                        }
+                    }
                     backend(args)?
                 };
                 if let Some(image) = edited {
@@ -1392,17 +1444,26 @@ impl App {
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    let (r, _) = ui.allocate_exact_size(egui::vec2(16., 16.), egui::Sense::hover());
-                    visual::icon(
-                        ui.painter(),
-                        r,
-                        if self.error { Icon::Close } else { Icon::Check },
-                        if self.error {
-                            visual::colors(ctx).red
-                        } else {
-                            visual::colors(ctx).green
-                        },
-                    );
+                    if self.busy {
+                        ui.add(
+                            egui::Spinner::new()
+                                .size(16.)
+                                .color(visual::colors(ctx).accent),
+                        );
+                    } else {
+                        let (r, _) =
+                            ui.allocate_exact_size(egui::vec2(16., 16.), egui::Sense::hover());
+                        visual::icon(
+                            ui.painter(),
+                            r,
+                            if self.error { Icon::Close } else { Icon::Check },
+                            if self.error {
+                                visual::colors(ctx).red
+                            } else {
+                                visual::colors(ctx).green
+                            },
+                        );
+                    }
                     ui.add(
                         egui::Label::new(RichText::new(&self.status).size(12.).color(
                             if self.error {
@@ -1417,7 +1478,9 @@ impl App {
                         if visual::small_button(ui, Icon::Log, "Activity").clicked() {
                             self.show_log = !self.show_log;
                         }
-                        if self.show_log && ui.small_button("Copy log").clicked() {
+                        if self.show_log
+                            && visual::small_button(ui, Icon::Copy, "Copy log").clicked()
+                        {
                             ctx.copy_text(self.log.clone());
                         }
                     });
@@ -1850,7 +1913,11 @@ impl App {
                 self.choose_source(ctx);
             }
             if banks {
-                let menu = ui.menu_button("Detect USB ▾", |ui| {
+                let detect = visual::small_button(ui, Icon::Search, "Detect USB ▾");
+                if detect.clicked() {
+                    self.detected = crate::usb::detect();
+                }
+                egui::Popup::menu(&detect).show(|ui| {
                     if self.detected.is_empty() {
                         ui.label("No USB disks detected. Check that the drive is plugged in.");
                     }
@@ -1866,15 +1933,12 @@ impl App {
                         self.status = "Ready to scan".into();
                         ui.close();
                     }
+                    ui.separator();
                     if ui.button("Search again").clicked() {
                         self.detected = crate::usb::detect();
                     }
                 });
-                if menu.response.clicked() {
-                    self.detected = crate::usb::detect();
-                }
-                menu.response
-                    .on_hover_text("List connected USB disks to use as the bank source");
+                detect.on_hover_text("List connected USB disks to use as the bank source");
                 let old = self.profile.clone();
                 egui::ComboBox::from_id_salt("bank-profile")
                     .width(120.)
@@ -1959,7 +2023,7 @@ impl App {
                 "New disk",
                 "Create a formatted floppy image · Ctrl/Cmd+N",
                 true,
-                true,
+                !banks,
             )
             .clicked()
             {
@@ -2032,6 +2096,51 @@ impl App {
             .clicked()
             {
                 self.export_selected(ctx);
+            }
+            let files: Vec<_> = selected.iter().filter(|r| !r.directory).collect();
+            let (can_swap, swap_hint) = if banks {
+                (
+                    !self.rows.is_empty()
+                        && selected.len() <= 2
+                        && selected.iter().all(|r| r.bank.is_some()),
+                    "Exchange the disks in two banks — select one or two banks",
+                )
+            } else {
+                (
+                    self.listing.as_ref().is_some_and(|l| l.root == l.directory)
+                        && !readonly
+                        && files.len() == selected.len()
+                        && selected.len() <= 2,
+                    "Exchange two indexed slots (for example DSKA0001 and DSKA0003)",
+                )
+            };
+            if visual::toolbar_button(ui, Icon::Swap, "Swap", swap_hint, can_swap, false).clicked() {
+                self.swap_form();
+            }
+            let format_target = selected.first().filter(|r| {
+                single
+                    && if banks {
+                        r.bank.is_some()
+                    } else {
+                        !readonly && !r.is_hfe() && crate::fat12::capacity_for(r.size).is_some()
+                    }
+            });
+            if visual::toolbar_button(
+                ui,
+                Icon::Format,
+                "Format",
+                if banks {
+                    "Erase the selected bank to a blank FAT12 floppy"
+                } else {
+                    "Erase the selected raw floppy image to a blank FAT12 disk"
+                },
+                format_target.is_some(),
+                false,
+            )
+            .clicked()
+                && let Some(row) = format_target.cloned()
+            {
+                self.format_form(&row);
             }
             if banks {
                 let replace = visual::toolbar_menu(
@@ -2250,6 +2359,175 @@ impl App {
             summary: vec![],
         });
     }
+    fn custom_form(
+        &self,
+        title: String,
+        description: &str,
+        command: &str,
+        fields: &[(&str, Kind, String)],
+        media: bool,
+    ) -> Form {
+        Form {
+            title,
+            description: description.into(),
+            command: command.into(),
+            labels: fields.iter().map(|f| f.0.to_string()).collect(),
+            kinds: fields.iter().map(|f| f.1).collect(),
+            values: fields.iter().map(|f| f.2.clone()).collect(),
+            media,
+            writes_media: media,
+            confirm: true,
+            review: false,
+            keepalive: None,
+            editor: None,
+            batch: None,
+            eject: None,
+            summary: vec![],
+        }
+    }
+    /// Swap two banks (Gotek USB) or two indexed slots (image library).
+    /// The current selection prefills the two numbers.
+    fn swap_form(&mut self) {
+        self.error = false;
+        let selected = self.selection();
+        if self.workspace == Workspace::Banks {
+            let banks: Vec<u16> = selected.iter().filter_map(|r| r.bank).collect();
+            let a = banks.first().copied().unwrap_or(0);
+            let b = banks
+                .get(1)
+                .copied()
+                .unwrap_or(if a == 0 { 1 } else { a - 1 });
+            self.form = Some(self.custom_form(
+                "Swap two banks".into(),
+                "Exchange the floppies stored in two banks. Both current disks are saved as recovery images first, then each bank is written and verified. Other banks are not touched; the USB must be unmounted.",
+                "bank-swap",
+                &[
+                    ("Target", Kind::Text, self.source.clone()),
+                    ("Profile", Kind::Text, self.profile.clone()),
+                    ("First bank", Kind::Text, a.to_string()),
+                    ("Second bank", Kind::Text, b.to_string()),
+                    ("Recovery copy of the first bank", Kind::Save, default_recovery_path(a).to_string_lossy().into_owned()),
+                    ("Recovery copy of the second bank", Kind::Save, default_recovery_path(b).to_string_lossy().into_owned()),
+                ],
+                false,
+            ));
+        } else {
+            self.open_form("slot-swap");
+            let prefix =
+                crate::slots::prefix(Path::new(&self.root)).unwrap_or_else(|_| "DSKA".into());
+            let numbers: Vec<u16> = selected
+                .iter()
+                .filter_map(|r| crate::slots::slot_of(&r.name, &prefix))
+                .collect();
+            if let Some(form) = &mut self.form {
+                for (value, n) in form.values.iter_mut().zip(&numbers) {
+                    *value = n.to_string();
+                }
+            }
+        }
+    }
+    /// Erase a bank or a standalone raw image to a blank FAT12 floppy.
+    fn format_form(&mut self, row: &DiskRow) {
+        self.error = false;
+        if let Some(bank) = row.bank {
+            self.form = Some(self.custom_form(
+                format!("Format bank {bank:03}"),
+                "Erase this bank and replace it with a blank FAT12 floppy. The current disk is saved as a recovery image first. Other banks are not touched; the USB must be unmounted.",
+                "bank-format",
+                &[
+                    ("Target", Kind::Text, self.source.clone()),
+                    ("Profile", Kind::Text, self.profile.clone()),
+                    ("Bank", Kind::Text, bank.to_string()),
+                    ("Disk label (up to 11 characters)", Kind::Text, format!("FDISK{bank:03}")),
+                    ("Recovery copy of the current bank", Kind::Save, default_recovery_path(bank).to_string_lossy().into_owned()),
+                ],
+                false,
+            ));
+            return;
+        }
+        let stem = row
+            .path
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        let label: String = stem
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == ' ' || *c == '_' || *c == '-')
+            .take(11)
+            .collect::<String>()
+            .trim()
+            .to_ascii_uppercase();
+        self.form = Some(self.custom_form(
+            format!("Format {}", row.name),
+            "Erase this image and replace it with a blank FAT12 floppy of the same capacity. The current contents are saved as a recovery image first.",
+            "image-format",
+            &[
+                ("Disk image", Kind::Text, row.path.to_string_lossy().into_owned()),
+                ("Disk label (up to 11 characters)", Kind::Text, if label.is_empty() { "DISK".into() } else { label }),
+                (
+                    "Recovery copy of the current contents",
+                    Kind::Save,
+                    new_image_path(&recovery_dir(), &format!("{stem}-before-format-{}", utc_timestamp()))
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+            ],
+            false,
+        ));
+    }
+    fn bank_name(&self, bank: &str) -> String {
+        let number = bank.trim().parse::<u16>().ok();
+        self.rows
+            .iter()
+            .find(|r| r.bank.is_some() && r.bank == number)
+            .map(|r| format!("{} · {}", r.name, r.kind))
+            .unwrap_or_else(|| "not scanned".into())
+    }
+    /// Plain-language review lines for swap and format confirmations.
+    fn review_summary(&self, form: &Form) -> Vec<String> {
+        let v = &form.values;
+        match form.command.as_str() {
+            "bank-swap" => vec![
+                format!("Swap banks {:0>3} and {:0>3} on {}", v[2].trim(), v[3].trim(), v[0]),
+                format!("Bank {:0>3} now: {}", v[2].trim(), self.bank_name(&v[2])),
+                format!("Bank {:0>3} now: {}", v[3].trim(), self.bank_name(&v[3])),
+                format!("Recovery copies: {} and {}", v[4], v[5]),
+                "Both banks are saved first, then written and verified. If a write fails, both banks are restored. Other banks are not touched.".into(),
+            ],
+            "bank-format" => vec![
+                format!("Erase bank {:0>3} on {}", v[2].trim(), v[0]),
+                format!("Currently: {}", self.bank_name(&v[2])),
+                format!(
+                    "New disk: blank FAT12 {} · label {}",
+                    if v[1] == "gotek720" { "720 KB" } else { "1.44 MB" },
+                    v[3].trim().to_ascii_uppercase()
+                ),
+                format!("Recovery copy: {}", v[4]),
+                "Everything on this bank is erased. The recovery copy lets you load the old disk back with Load image.".into(),
+            ],
+            "image-format" => {
+                let size = fs::metadata(&v[0]).map(|m| m.len()).unwrap_or(0);
+                vec![
+                    format!("Erase {}", v[0]),
+                    match crate::fat12::capacity_for(size) {
+                        Some(kib) => format!(
+                            "New disk: blank FAT12 {kib} KiB · label {}",
+                            v[1].trim().to_ascii_uppercase()
+                        ),
+                        None => format!("Warning: {} is not a standard floppy size; formatting will be refused", format_size(size)),
+                    },
+                    format!("Recovery copy: {}", v[2]),
+                    "Every file on this disk is erased. The image keeps its name and capacity.".into(),
+                ]
+            }
+            "slot-swap" => vec![
+                format!("Swap slots {:0>4} and {:0>4} in {}", v[0].trim(), v[1].trim(), self.root),
+                "Images are renamed in place; their contents are not copied or changed. The Gotek shows each image under its new slot number.".into(),
+            ],
+            _ => vec![],
+        }
+    }
     fn disk_command(&mut self, ctx: &egui::Context, command: &'static str) {
         let selected = self.selection();
         let [row] = selected.as_slice() else {
@@ -2313,6 +2591,12 @@ impl App {
                     self.trash_form(row);
                 }
             }
+            DiskAction::Swap => self.swap_form(),
+            DiskAction::Format => {
+                if let [row] = selected.as_slice() {
+                    self.format_form(row);
+                }
+            }
             DiskAction::Command(cmd) if cmd.starts_with("bank-") || cmd == "slot" => {
                 self.open_form(cmd)
             }
@@ -2320,12 +2604,12 @@ impl App {
         }
     }
     fn sort_header(&mut self, ui: &mut egui::Ui, label: &str, sort: Sort) {
-        let label = if self.sort == sort {
-            format!("{label} {}", if self.descending { "v" } else { "^" })
-        } else {
-            label.into()
-        };
-        if ui.selectable_label(self.sort == sort, label).clicked() {
+        let active = self.sort == sort;
+        let response = ui.selectable_label(active, RichText::new(label).strong());
+        if active {
+            visual::sort_arrow(ui, self.descending);
+        }
+        if response.on_hover_text("Sort by this column").clicked() {
             if self.sort == sort {
                 self.descending = !self.descending;
             } else {
@@ -2492,7 +2776,7 @@ impl App {
                             egui::Label::new(RichText::new(&row.kind).color(if row.recognized {
                                 visual::colors(ui.ctx()).green
                             } else {
-                                Color32::GRAY
+                                visual::colors(ui.ctx()).muted
                             }))
                             .selectable(false),
                         );
@@ -2585,26 +2869,40 @@ impl App {
                         }
                         ui.separator();
                         ui.horizontal(|ui| {
-                            if ui.button("Back").clicked() {
+                            if visual::small_button(ui, Icon::Back, "Back").clicked() {
                                 form.review = false;
                             }
-                            if ui
-                                .add(
-                                    egui::Button::new(
-                                        RichText::new(if form.eject.is_some() {
-                                            "Eject and power off".to_string()
-                                        } else if form.command == "gui-replace-bank" {
-                                            format!("Write to bank {:0>3}", form.values[2])
-                                        } else {
-                                            "Confirm and run".to_string()
-                                        })
-                                        .strong()
-                                        .color(Color32::WHITE),
-                                    )
-                                    .fill(visual::BLUE),
-                                )
-                                .clicked()
-                            {
+                            let v = &form.values;
+                            let label = if form.eject.is_some() {
+                                "Eject and power off".to_string()
+                            } else {
+                                match form.command.as_str() {
+                                    "gui-replace-bank" => format!("Write to bank {:0>3}", v[2]),
+                                    "bank-swap" => format!(
+                                        "Swap banks {:0>3} and {:0>3}",
+                                        v[2].trim(),
+                                        v[3].trim()
+                                    ),
+                                    "slot-swap" => format!(
+                                        "Swap slots {:0>4} and {:0>4}",
+                                        v[0].trim(),
+                                        v[1].trim()
+                                    ),
+                                    "bank-format" => format!("Erase bank {:0>3}", v[2].trim()),
+                                    "image-format" => "Erase and format disk".to_string(),
+                                    _ => "Confirm and run".to_string(),
+                                }
+                            };
+                            let destructive = matches!(
+                                form.command.as_str(),
+                                "bank-format" | "image-format" | "remove" | "device-restore"
+                            );
+                            let clicked = if destructive {
+                                visual::danger_button(ui, &label).clicked()
+                            } else {
+                                visual::primary_button(ui, &label, true).clicked()
+                            };
+                            if clicked {
                                 execute = true;
                             }
                         });
@@ -2679,7 +2977,8 @@ impl App {
                                             );
                                         }
                                         if !matches!(form.kinds[i], Kind::Text)
-                                            && ui.button("Browse…").clicked()
+                                            && visual::small_button(ui, Icon::Folder, "Browse…")
+                                                .clicked()
                                         {
                                             browse = Some((i, form.kinds[i]));
                                         }
@@ -2703,35 +3002,37 @@ impl App {
                             ui.colored_label(visual::colors(ui.ctx()).amber, message);
                         }
                         let valid = validation.is_ok() && !readonly;
-                        if ui
-                            .add_enabled(
-                                valid,
-                                egui::Button::new(if form.editor.is_some() {
-                                    "Save changes"
-                                } else if form.command == "gui-replace-bank" {
-                                    "Continue…"
-                                } else if form.confirm {
-                                    "Review changes…"
-                                } else if form.command == "create-fat12" {
-                                    "Create disk"
-                                } else if matches!(
-                                    form.command.as_str(),
-                                    "image-import"
-                                        | "image-mkdir"
-                                        | "image-remove"
-                                        | "image-rename"
-                                        | "image-label"
-                                ) {
-                                    "Save edited copy"
-                                } else {
-                                    "Run operation"
-                                }),
-                            )
-                            .clicked()
+                        ui.add_space(4.);
+                        if visual::primary_button(
+                            ui,
+                            if form.editor.is_some() {
+                                "Save changes"
+                            } else if form.command == "gui-replace-bank" {
+                                "Continue…"
+                            } else if form.confirm {
+                                "Review changes…"
+                            } else if form.command == "create-fat12" {
+                                "Create disk"
+                            } else if matches!(
+                                form.command.as_str(),
+                                "image-import"
+                                    | "image-mkdir"
+                                    | "image-remove"
+                                    | "image-rename"
+                                    | "image-label"
+                            ) {
+                                "Save edited copy"
+                            } else {
+                                "Run operation"
+                            },
+                            valid,
+                        )
+                        .clicked()
                         {
                             if form.command == "gui-replace-bank" {
                                 prepare_load = true;
                             } else if form.confirm {
+                                form.summary = self.review_summary(&form);
                                 form.review = true;
                             } else {
                                 execute = true;
@@ -2773,6 +3074,7 @@ impl App {
         let mut extract = false;
         let mut import_batch = None;
         let mut remove_batch = false;
+        let mut format = false;
         egui::Window::new(format!("Disk contents — {}", preview.title))
             .id(egui::Id::new("preview")).open(&mut open).default_size([720.0, 510.0])
             .show(ctx, |ui| {
@@ -2782,18 +3084,19 @@ impl App {
                     ui.horizontal_wrapped(|ui| {
                         ui.heading(if preview.label.is_empty() { "Unlabelled disk" } else { &preview.label });
                         if visual::small_button(ui, Icon::Edit, "Change label").clicked() { action = Some("image-label"); }
+                        if visual::small_button(ui, Icon::Format, "Format disk…").on_hover_text("Erase every file and start with a blank disk").clicked() { format = true; }
                     });
                     ui.label(RichText::new("Changes save directly to this disk. Use Export first if you want a backup.").small().weak());
                     ui.horizontal_wrapped(|ui| {
                         if ui.add_enabled_ui(preview.directory != "/", |ui| visual::small_button(ui, Icon::Up, "Up")).inner.clicked() {
                             directory = Some(parent_directory(&preview.directory));
                         }
-                        if ui.small_button("Disk root").clicked() { directory = Some("/".into()); }
+                        if visual::text_button(ui, "Disk root").clicked() { directory = Some("/".into()); }
                         let mut path = String::new();
                         for part in preview.directory.split('/').filter(|p| !p.is_empty()) {
                             path = inner_path(&path, part);
-                            ui.label("/");
-                            if ui.small_button(part).clicked() { directory = Some(path.clone()); }
+                            ui.label(RichText::new("/").color(visual::colors(ui.ctx()).muted));
+                            if visual::text_button(ui, part).clicked() { directory = Some(path.clone()); }
                         }
                     });
                     ui.horizontal_wrapped(|ui| {
@@ -2813,12 +3116,12 @@ impl App {
                     });
                     ui.separator();
                     ui.horizontal(|ui| {
-                        if ui.small_button("Select all").clicked() {
+                        if visual::text_button(ui, "Select all").clicked() {
                             preview.checked = preview.entries.iter().map(|e| e.name.clone()).collect();
                             preview.selected = preview.checked.iter().next().cloned();
                         }
-                        if ui.small_button("Clear selection").clicked() { preview.checked.clear(); preview.selected = None; }
-                        ui.label(format!("{} selected", preview.checked.len()));
+                        if visual::text_button(ui, "Clear selection").clicked() { preview.checked.clear(); preview.selected = None; }
+                        ui.label(RichText::new(format!("{} selected", preview.checked.len())).size(12.).color(visual::colors(ui.ctx()).muted));
                     });
                     TableBuilder::new(ui).id_salt("contents-table").striped(true)
                         .column(Column::remainder()).column(Column::initial(80.0)).column(Column::initial(100.0))
@@ -2861,6 +3164,21 @@ impl App {
                     if preview.entries.is_empty() { ui.label("This folder is empty. Add a file or create a folder to get started."); }
                 });
             });
+        if format {
+            // The open view would be stale after formatting, so close it.
+            let row = DiskRow {
+                key: String::new(),
+                name: preview.title.clone(),
+                kind: "FAT12".into(),
+                size: fs::metadata(&preview.image).map(|m| m.len()).unwrap_or(0),
+                path: preview.target.clone(),
+                bank: preview.bank.as_ref().map(|(_, n)| *n),
+                directory: false,
+                recognized: true,
+            };
+            self.format_form(&row);
+            return;
+        }
         if let Some(folders) = import_batch {
             let preview = preview.clone();
             self.worker(ctx, "Choose items to add…", move || {
@@ -2965,6 +3283,8 @@ enum DiskAction {
     Export,
     Replace,
     Trash,
+    Swap,
+    Format,
     Command(&'static str),
 }
 impl DiskRow {
@@ -3042,6 +3362,19 @@ fn disk_menu(
     ) {
         action = Some(DiskAction::Export);
     }
+    if let [a, b] = rows {
+        if a.bank.is_some() && b.bank.is_some() {
+            ui.separator();
+            if menu_item(ui, "Swap these two banks…", true) {
+                action = Some(DiskAction::Swap);
+            }
+        } else if !a.directory && !b.directory && a.bank.is_none() && b.bank.is_none() {
+            ui.separator();
+            if menu_item(ui, "Swap their indexed slots…", !readonly) {
+                action = Some(DiskAction::Swap);
+            }
+        }
+    }
     if let [row] = rows
         && !row.directory
     {
@@ -3082,6 +3415,12 @@ fn disk_menu(
             if menu_item(ui, "Load image into bank…", true) {
                 action = Some(DiskAction::Replace);
             }
+            if menu_item(ui, "Swap with another bank…", true) {
+                action = Some(DiskAction::Swap);
+            }
+            if menu_item(ui, "Format bank…", true) {
+                action = Some(DiskAction::Format);
+            }
             if menu_item(ui, "Replace using expected original…", true) {
                 action = Some(DiskAction::Command("bank-write"));
             }
@@ -3092,6 +3431,12 @@ fn disk_menu(
             ui.separator();
             if row.recognized && menu_item(ui, "Assign to indexed slot…", !readonly) {
                 action = Some(DiskAction::Command("slot"));
+            }
+            if !row.is_hfe()
+                && crate::fat12::capacity_for(row.size).is_some()
+                && menu_item(ui, "Format disk…", !readonly)
+            {
+                action = Some(DiskAction::Format);
             }
             if menu_item(ui, "Move to trash…", !readonly) {
                 action = Some(DiskAction::Trash);
@@ -3664,6 +4009,54 @@ fn backend(args: Vec<String>) -> Result<String, String> {
                     Path::new(recovery),
                 )?;
                 format!("Bank {bank} written and verified. Recovery image: {recovery}")
+            }
+            [
+                "bank-swap",
+                target,
+                profile,
+                a,
+                b,
+                recovery_a,
+                recovery_b,
+                "--confirm-write",
+            ] => {
+                crate::banks::swap_banks(
+                    Path::new(target),
+                    profile,
+                    a.parse()?,
+                    b.parse()?,
+                    Path::new(recovery_a),
+                    Path::new(recovery_b),
+                )?;
+                format!(
+                    "Banks {a:0>3} and {b:0>3} swapped and verified. Recovery images: {recovery_a} and {recovery_b}"
+                )
+            }
+            [
+                "bank-format",
+                target,
+                profile,
+                bank,
+                label,
+                recovery,
+                "--confirm-write",
+            ] => {
+                crate::banks::format_bank(
+                    Path::new(target),
+                    profile,
+                    bank.parse()?,
+                    if *label == "-" { "" } else { label },
+                    Path::new(recovery),
+                )?;
+                format!("Bank {bank:0>3} formatted and verified. Recovery image: {recovery}")
+            }
+            ["image-format", image, label, recovery, "--confirm-write"] => {
+                crate::banks::format_image(
+                    Path::new(image),
+                    if *label == "-" { "" } else { label },
+                    Path::new(recovery),
+                )?;
+                format!("{image} formatted and verified. Recovery image: {recovery}")
             }
             [
                 "device-restore",
@@ -4647,6 +5040,71 @@ mod tests {
         });
         assert!(text_position(&output.shapes, "Export selected disks…").is_some());
         assert!(text_position(&output.shapes, "Load image into bank…").is_none());
+    }
+    #[test]
+    fn swap_and_format_prefill_from_selection_and_wait_for_review() {
+        let ctx = egui::Context::default();
+        visual::apply(&ctx);
+        let mut app = app();
+        app.workspace = Workspace::Banks;
+        app.source = "unused-test-device".into();
+        app.rows = [4u16, 9]
+            .map(|n| DiskRow {
+                key: format!("bank:{n:03}"),
+                name: format!("FDISK{n:03}"),
+                kind: "Matching FAT BPB".into(),
+                size: 1_474_560,
+                path: "unused-test-device".into(),
+                bank: Some(n),
+                directory: false,
+                recognized: true,
+            })
+            .to_vec();
+        app.selected = app.rows.iter().map(|r| r.key.clone()).collect();
+        app.swap_form();
+        let form = app.form.as_mut().unwrap();
+        assert_eq!(form.command, "bank-swap");
+        assert_eq!(
+            (form.values[2].as_str(), form.values[3].as_str()),
+            ("4", "9")
+        );
+        assert!(
+            form.args("")
+                .unwrap()
+                .contains(&"--confirm-write".to_string())
+        );
+        let mut same = form.clone();
+        same.values[3] = "4".into();
+        assert!(same.args("").is_err());
+        app.execute_form(&ctx);
+        assert!(!app.busy, "a swap must not run before review");
+        let summary = app.review_summary(app.form.as_ref().unwrap());
+        assert!(summary[1].contains("FDISK004") && summary[2].contains("FDISK009"));
+        app.form.as_mut().unwrap().review = true;
+        app.form.as_mut().unwrap().summary = summary;
+        render(&mut app, &ctx, vec![]);
+        let output = render(&mut app, &ctx, vec![]);
+        assert!(text_position(&output.shapes, "Swap banks 004 and 009").is_some());
+
+        let row = app.rows[0].clone();
+        app.format_form(&row);
+        let form = app.form.as_ref().unwrap();
+        assert_eq!(form.command, "bank-format");
+        assert_eq!(form.values[3], "FDISK004");
+        assert!(form.confirm && !form.review);
+        let mut bad = form.clone();
+        bad.values[3] = "THIS LABEL IS TOO LONG".into();
+        assert!(bad.args("").is_err());
+
+        let temp = tempfile::tempdir().unwrap();
+        let disk = temp.path().join("game disk.img");
+        crate::fat12::create(&disk, 720).unwrap();
+        app.workspace = Workspace::Images;
+        app.format_form(&editor_row(&disk, None));
+        let form = app.form.as_ref().unwrap();
+        assert_eq!(form.command, "image-format");
+        assert_eq!(form.values[1], "GAME DISK");
+        assert!(app.review_summary(form)[1].contains("720 KiB"));
     }
     #[test]
     fn operating_system_close_waits_for_active_operation() {

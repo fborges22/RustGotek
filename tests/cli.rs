@@ -1613,3 +1613,172 @@ fn usb_eject_requires_explicit_confirmation_and_refuses_image_files() {
     );
     assert_eq!(fs::read(s.0.join("disk.img")).unwrap(), b"unchanged");
 }
+
+#[test]
+fn bank_swap_and_format_save_recovery_and_leave_other_banks() {
+    let s = Sandbox::new();
+    s.ok(&["bank-create", "usb.bin", "gotek720", "3", "minimum"]);
+    let stride = 1024 * 1024;
+    let payload = 720 * 1024;
+    let original = fs::read(s.0.join("usb.bin")).unwrap();
+    let bank = |data: &[u8], n: usize| data[n * stride..n * stride + payload].to_vec();
+    // Swapping requires confirmation and distinct banks.
+    assert!(
+        !s.run(&[
+            "bank-swap",
+            "usb.bin",
+            "gotek720",
+            "0",
+            "2",
+            "a.img",
+            "b.img"
+        ])
+        .status
+        .success()
+    );
+    assert!(
+        !s.run(&[
+            "bank-swap",
+            "usb.bin",
+            "gotek720",
+            "1",
+            "1",
+            "a.img",
+            "b.img",
+            "--confirm-write"
+        ])
+        .status
+        .success()
+    );
+    s.ok(&[
+        "bank-swap",
+        "usb.bin",
+        "gotek720",
+        "0",
+        "2",
+        "a.img",
+        "b.img",
+        "--confirm-write",
+    ]);
+    let swapped = fs::read(s.0.join("usb.bin")).unwrap();
+    assert_eq!(bank(&swapped, 0), bank(&original, 2));
+    assert_eq!(bank(&swapped, 2), bank(&original, 0));
+    assert_eq!(bank(&swapped, 1), bank(&original, 1));
+    assert_eq!(fs::read(s.0.join("a.img")).unwrap(), bank(&original, 0));
+    assert_eq!(fs::read(s.0.join("b.img")).unwrap(), bank(&original, 2));
+    // Existing recovery files are never overwritten.
+    assert!(
+        !s.run(&[
+            "bank-swap",
+            "usb.bin",
+            "gotek720",
+            "0",
+            "2",
+            "a.img",
+            "c.img",
+            "--confirm-write"
+        ])
+        .status
+        .success()
+    );
+    assert_eq!(fs::read(s.0.join("usb.bin")).unwrap(), swapped);
+
+    s.ok(&["bank-export", "usb.bin", "gotek720", "1", "before.img"]);
+    fs::write(s.0.join("data.bin"), b"payload").unwrap();
+    s.ok(&[
+        "image-import",
+        "before.img",
+        "data.bin",
+        "DATA.BIN",
+        "full.img",
+    ]);
+    s.ok(&[
+        "bank-write",
+        "usb.bin",
+        "gotek720",
+        "1",
+        "full.img",
+        "before.img",
+        "r1.img",
+        "--confirm-write",
+    ]);
+    s.ok(&[
+        "bank-format",
+        "usb.bin",
+        "gotek720",
+        "1",
+        "Blank Disk",
+        "r2.img",
+        "--confirm-write",
+    ]);
+    s.ok(&["bank-export", "usb.bin", "gotek720", "1", "after.img"]);
+    let listing = s.run(&["image-list", "after.img"]);
+    assert!(!String::from_utf8_lossy(&listing.stdout).contains("DATA.BIN"));
+    s.ok(&["image-check", "after.img"]);
+    let labelled = fs::read(s.0.join("after.img")).unwrap();
+    assert_eq!(&labelled[43..54], b"BLANK DISK ");
+    assert_eq!(
+        fs::read(s.0.join("r2.img")).unwrap(),
+        fs::read(s.0.join("full.img")).unwrap()
+    );
+    let formatted = fs::read(s.0.join("usb.bin")).unwrap();
+    assert_eq!(bank(&formatted, 0), bank(&swapped, 0));
+    assert_eq!(bank(&formatted, 2), bank(&swapped, 2));
+}
+
+#[test]
+fn image_format_erases_in_place_and_refuses_odd_sizes() {
+    let s = Sandbox::new();
+    s.ok(&["create-fat12", "disk.img", "1440"]);
+    fs::write(s.0.join("note.txt"), b"hello").unwrap();
+    s.ok(&[
+        "image-import",
+        "disk.img",
+        "note.txt",
+        "NOTE.TXT",
+        "full.img",
+    ]);
+    let before = fs::read(s.0.join("full.img")).unwrap();
+    assert!(
+        !s.run(&["image-format", "full.img", "-", "r.img"])
+            .status
+            .success()
+    );
+    s.ok(&["image-format", "full.img", "-", "r.img", "--confirm-write"]);
+    assert_eq!(fs::read(s.0.join("r.img")).unwrap(), before);
+    assert_eq!(
+        fs::metadata(s.0.join("full.img")).unwrap().len(),
+        before.len() as u64
+    );
+    s.ok(&["image-check", "full.img"]);
+    let listing = s.run(&["image-list", "full.img"]);
+    assert!(!String::from_utf8_lossy(&listing.stdout).contains("NOTE.TXT"));
+    fs::write(s.0.join("odd.img"), vec![0; 1000]).unwrap();
+    assert!(
+        !s.run(&["image-format", "odd.img", "-", "r2.img", "--confirm-write"])
+            .status
+            .success()
+    );
+    assert!(!s.0.join("r2.img").exists());
+}
+
+#[test]
+fn slot_swap_renames_both_images_and_moves_into_empty_slots() {
+    let s = Sandbox::new();
+    fs::create_dir(s.0.join("usb")).unwrap();
+    fs::write(s.0.join("usb/DSKA0001_game.img"), b"one").unwrap();
+    fs::write(s.0.join("usb/DSKA0003.hfe"), b"three").unwrap();
+    s.ok(&["slot-swap", "usb", "1", "3"]);
+    assert_eq!(fs::read(s.0.join("usb/DSKA0003_game.img")).unwrap(), b"one");
+    assert_eq!(fs::read(s.0.join("usb/DSKA0001.hfe")).unwrap(), b"three");
+    assert!(!s.0.join("usb/DSKA0001_game.img").exists());
+    s.ok(&["slot-swap", "usb", "1", "7"]);
+    assert_eq!(fs::read(s.0.join("usb/DSKA0007.hfe")).unwrap(), b"three");
+    assert!(!s.run(&["slot-swap", "usb", "4", "5"]).status.success());
+    assert!(!s.run(&["slot-swap", "usb", "3", "3"]).status.success());
+    let names: Vec<_> = fs::read_dir(s.0.join("usb"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(names.len(), 2, "{names:?}");
+}

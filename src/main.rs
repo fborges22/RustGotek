@@ -36,6 +36,10 @@ Commands:
   bank-replace BACKUP PROFILE N IMG OUT  Replace a bank in a NEW backup file
   bank-write TARGET PROFILE N IMG EXPECTED RECOVERY --confirm-write
                                    Write one bank, save original and verify
+  bank-swap TARGET PROFILE A B RECOVERY_A RECOVERY_B --confirm-write
+                                   Exchange two banks, saving both originals
+  bank-format TARGET PROFILE N LABEL|- RECOVERY --confirm-write
+                                   Erase bank N to a blank FAT12 floppy
   device-restore TARGET IMAGE EXPECTED RECOVERY --confirm-write
                                    Restore a whole device with recovery backup
   list ROOT                        List files recursively (links rejected)
@@ -44,6 +48,7 @@ Commands:
   slot ROOT SOURCE NUMBER|auto      Import to an indexed slot (0–999)
   slots ROOT                       Show indexed names, conflicts and next slot
   slot-move ROOT FROM TO            Reassign an image to a free slot (0–999)
+  slot-swap ROOT A B                Exchange two indexed slots by renaming
   export ROOT NAME DESTINATION      Copy a file out of the media
   remove ROOT NAME                  Move a file into .rustgotek-trash
   config-show ROOT                  Print FlashFloppy FF.CFG
@@ -56,6 +61,8 @@ Commands:
   firmware-stage ROOT FILE MCU      Stage an update for an explicit target MCU
   create PATH SIZE_KIB              Create a zero-filled raw image (unformatted)
   create-fat12 PATH SIZE_KIB        Create a formatted PC data floppy image
+  image-format PATH LABEL|- RECOVERY --confirm-write
+                                   Erase a raw floppy image to blank FAT12
   inspect-fat12 PATH                Check FAT12 layout and report free space
   inspect-hfe PATH                  Inspect HFE header and track-data extents
   convert-hfe INPUT OUTPUT PROFILE  Convert PC raw sectors to HFE v1
@@ -336,6 +343,43 @@ fn run(a: &[String]) -> Result<()> {
             Path::new(expected),
             Path::new(recovery),
         )?,
+        [
+            "bank-swap",
+            target,
+            profile,
+            a,
+            b,
+            recovery_a,
+            recovery_b,
+            "--confirm-write",
+        ] => banks::swap_banks(
+            Path::new(target),
+            profile,
+            a.parse()?,
+            b.parse()?,
+            Path::new(recovery_a),
+            Path::new(recovery_b),
+        )?,
+        [
+            "bank-format",
+            target,
+            profile,
+            bank,
+            label,
+            recovery,
+            "--confirm-write",
+        ] => banks::format_bank(
+            Path::new(target),
+            profile,
+            bank.parse()?,
+            if *label == "-" { "" } else { label },
+            Path::new(recovery),
+        )?,
+        ["image-format", path, label, recovery, "--confirm-write"] => banks::format_image(
+            Path::new(path),
+            if *label == "-" { "" } else { label },
+            Path::new(recovery),
+        )?,
         ["bank-export", source, profile, bank, out] => {
             banks::export(Path::new(source), profile, bank.parse()?, Path::new(out))?
         }
@@ -395,6 +439,7 @@ fn run(a: &[String]) -> Result<()> {
         }
         ["slots", r] => slots::list(&root(r)?)?,
         ["slot-move", r, from, to] => slots::move_slot(&root(r)?, from.parse()?, to.parse()?)?,
+        ["slot-swap", r, a, b] => slots::swap_slots(&root(r)?, a.parse()?, b.parse()?)?,
         ["export", r, name, destination] => {
             copy_new(&within(&root(r)?, name)?, Path::new(destination))?
         }

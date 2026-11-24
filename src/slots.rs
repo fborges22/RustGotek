@@ -101,6 +101,87 @@ pub fn list(base: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The slot number encoded in an indexed filename, if it uses `prefix`.
+pub fn slot_of(name: &str, prefix: &str) -> Option<u16> {
+    let upper = name.to_ascii_uppercase();
+    let digits = upper.strip_prefix(&prefix.to_ascii_uppercase())?.get(..4)?;
+    digits
+        .bytes()
+        .all(|b| b.is_ascii_digit())
+        .then(|| digits.parse().ok())
+        .flatten()
+}
+
+/// Exchange two indexed slots by renaming in place (no copies). If one slot
+/// is empty, the other image simply moves there. Suffixes are preserved.
+pub fn swap_slots(base: &Path, a: u16, b: u16) -> Result<()> {
+    if a > 999 || b > 999 {
+        return Err("slot must be 0–999".into());
+    }
+    if a == b {
+        return Err("choose two different slots".into());
+    }
+    let prefix = prefix(base)?;
+    let occupied = scan(base, &prefix)?;
+    let single = |n: u16| -> Result<Option<String>> {
+        match occupied.get(&n).map(Vec::as_slice) {
+            None => Ok(None),
+            Some([name]) => {
+                crate::image_extension(Path::new(name))?;
+                if !fs::symlink_metadata(crate::within(base, name)?)?.is_file() {
+                    return Err(format!("slot {n:04} is not a regular image file").into());
+                }
+                Ok(Some(name.clone()))
+            }
+            Some(_) => Err(format!("slot {n:04} has conflicting assignments").into()),
+        }
+    };
+    let (first, second) = (single(a)?, single(b)?);
+    let renamed = |name: &str, to: u16| -> Result<String> {
+        let suffix = name
+            .get(prefix.len() + 4..)
+            .ok_or("invalid indexed filename")?;
+        Ok(format!("{prefix}{to:04}{suffix}"))
+    };
+    let rename = |from: &str, to: &str| -> Result<()> {
+        let destination = crate::within(base, to)?;
+        if destination.exists() {
+            return Err(format!("{to} already exists; nothing renamed").into());
+        }
+        fs::rename(crate::within(base, from)?, destination)?;
+        Ok(())
+    };
+    match (first, second) {
+        (None, None) => return Err("both slots are empty".into()),
+        (Some(name), None) => rename(&name, &renamed(&name, b)?)?,
+        (None, Some(name)) => rename(&name, &renamed(&name, a)?)?,
+        (Some(x), Some(y)) => {
+            let temp = (0..1000)
+                .map(|n| format!(".rustgotek-swap-{n}"))
+                .find(|t| crate::within(base, t).is_ok_and(|p| !p.exists()))
+                .ok_or("no temporary name available")?;
+            let (new_x, new_y) = (renamed(&x, b)?, renamed(&y, a)?);
+            rename(&x, &temp)?;
+            if let Err(error) = rename(&y, &new_y) {
+                let _ = rename(&temp, &x);
+                return Err(error);
+            }
+            if let Err(error) = rename(&temp, &new_x) {
+                let undo = rename(&new_y, &y).and_then(|()| rename(&temp, &x));
+                return Err(match undo {
+                    Ok(()) => format!("swap failed ({error}); original names restored"),
+                    Err(e) => format!(
+                        "swap failed ({error}); restoring names also failed ({e}); check {temp}"
+                    ),
+                }
+                .into());
+            }
+        }
+    }
+    println!("Swapped slots {a:04} and {b:04}");
+    Ok(())
+}
+
 pub fn move_slot(base: &Path, from: u16, to: u16) -> Result<()> {
     if from > 999 || to > 999 {
         return Err("slot must be 0–999".into());

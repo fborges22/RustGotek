@@ -593,6 +593,139 @@ pub fn write_bank(
     Ok(())
 }
 
+/// Save `data` to a new recovery file, sync it and read it back.
+fn save_recovery(recovery: &Path, data: &[u8]) -> Result<()> {
+    new_output(recovery, |file| {
+        file.write_all(data)?;
+        Ok(())
+    })?;
+    #[cfg(unix)]
+    File::open(
+        recovery
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new(".")),
+    )?
+    .sync_all()?;
+    if read_floppy(recovery, data.len() as u64)? != data {
+        return Err("recovery verification failed; target unchanged".into());
+    }
+    Ok(())
+}
+
+/// Exchange the floppies in two banks. Both originals are saved to new,
+/// verified recovery files before the first write; a failed write restores
+/// both banks.
+pub fn swap_banks(
+    target: &Path,
+    profile: &str,
+    a: u16,
+    b: u16,
+    recovery_a: &Path,
+    recovery_b: &Path,
+) -> Result<()> {
+    let layout = Profile::parse(profile)?;
+    layout.offset(a, u64::MAX)?;
+    layout.offset(b, u64::MAX)?;
+    if a == b {
+        return Err("choose two different banks to swap".into());
+    }
+    if recovery_a == recovery_b {
+        return Err("each bank needs its own recovery file".into());
+    }
+    let mut file = open_write_target(target)?;
+    let size = file.seek(SeekFrom::End(0))?;
+    let (offset_a, offset_b) = (layout.offset(a, size)?, layout.offset(b, size)?);
+    let length = layout.payload as usize;
+    let first = read_bank(&mut file, offset_a, length)?;
+    let second = read_bank(&mut file, offset_b, length)?;
+    if first == second {
+        println!("Banks {a:03} and {b:03} are identical. Nothing to swap.");
+        return Ok(());
+    }
+    save_recovery(recovery_a, &first)?;
+    save_recovery(recovery_b, &second)?;
+    if read_bank(&mut file, offset_a, length)? != first
+        || read_bank(&mut file, offset_b, length)? != second
+    {
+        return Err("banks changed while saving recovery copies; swap cancelled".into());
+    }
+    replace_with_recovery(&mut file, offset_a, &first, &second)?;
+    if let Err(error) = write_verified(&mut file, offset_b, &first) {
+        let undo_b = write_verified(&mut file, offset_b, &second);
+        let undo_a = write_verified(&mut file, offset_a, &first);
+        return Err(match (undo_a, undo_b) {
+            (Ok(()), Ok(())) => format!("swap failed ({error}); both banks restored and verified; recovery files retained"),
+            (a_result, b_result) => format!(
+                "swap failed ({error}); automatic recovery also failed ({}). Retain both recovery files",
+                [a_result.err(), b_result.err()].into_iter().flatten().map(|e| e.to_string()).collect::<Vec<_>>().join("; ")
+            ),
+        }
+        .into());
+    }
+    println!(
+        "Swapped and verified banks {a:03} and {b:03}. Recovery: {} and {}. Other banks and padding were not written.",
+        recovery_a.display(),
+        recovery_b.display()
+    );
+    Ok(())
+}
+
+/// Erase one bank to a blank FAT12 floppy. The original is saved first.
+pub fn format_bank(
+    target: &Path,
+    profile: &str,
+    bank: u16,
+    label: &str,
+    recovery: &Path,
+) -> Result<()> {
+    let layout = Profile::parse(profile)?;
+    layout.offset(bank, u64::MAX)?;
+    let blank = crate::fat12::formatted_labelled((layout.payload / 1024) as usize, label)?;
+    let mut file = open_write_target(target)?;
+    let size = file.seek(SeekFrom::End(0))?;
+    let offset = layout.offset(bank, size)?;
+    let original = read_bank(&mut file, offset, blank.len())?;
+    save_recovery(recovery, &original)?;
+    if read_bank(&mut file, offset, original.len())? != original {
+        return Err("target bank changed while saving recovery; format cancelled".into());
+    }
+    replace_with_recovery(&mut file, offset, &original, &blank)?;
+    println!(
+        "Formatted bank {bank:03} as a blank FAT12 disk{}. Recovery: {}. Other banks were not written.",
+        if label.trim().is_empty() {
+            String::new()
+        } else {
+            format!(" labelled {}", label.trim().to_ascii_uppercase())
+        },
+        recovery.display()
+    );
+    Ok(())
+}
+
+/// Erase a standalone raw floppy image in place, keeping its capacity.
+pub fn format_image(target: &Path, label: &str, recovery: &Path) -> Result<()> {
+    if !fs::symlink_metadata(target)?.is_file() {
+        return Err("only regular image files can be formatted".into());
+    }
+    let original = fs::read(target)?;
+    let kib = crate::fat12::capacity_for(original.len() as u64).ok_or_else(|| {
+        format!(
+            "{} bytes is not a standard floppy size; formatting supports 360, 720, 1200, 1440 and 2880 KiB raw images",
+            original.len()
+        )
+    })?;
+    let blank = crate::fat12::formatted_labelled(kib, label)?;
+    save_recovery(recovery, &original)?;
+    edit_disk(target, None, &original, &blank)?;
+    println!(
+        "Formatted {} as a blank {kib} KiB FAT12 disk. Recovery: {}",
+        target.display(),
+        recovery.display()
+    );
+    Ok(())
+}
+
 fn first_difference(
     a: &mut (impl Read + Seek),
     b: &mut (impl Read + Seek),

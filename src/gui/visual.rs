@@ -178,6 +178,10 @@ pub enum Icon {
     Log,
     Close,
     Up,
+    Swap,
+    Format,
+    Back,
+    Copy,
 }
 
 /// A small consistent outline icon set, drawn in a 24-unit coordinate space.
@@ -268,10 +272,19 @@ pub fn icon(p: &egui::Painter, rect: Rect, glyph: Icon, color: Color32) {
             box_at(7., 3., 9., 6.);
             box_at(7., 14., 10., 7.);
             if matches!(glyph, Icon::Add) {
-                p.circle_filled(point(19., 18.), 6.0 * scale, BLUE);
-                let white = Stroke::new(1.7 * scale, Color32::WHITE);
-                p.line_segment([point(16., 18.), point(22., 18.)], white);
-                p.line_segment([point(19., 15.), point(19., 21.)], white);
+                // Keep the badge visible on blue (primary) and dimmed (disabled) buttons.
+                let c = colors(p.ctx());
+                let (fill, mark) = if color == Color32::WHITE {
+                    (Color32::WHITE, BLUE)
+                } else if color == c.disabled {
+                    (c.disabled, c.surface)
+                } else {
+                    (BLUE, Color32::WHITE)
+                };
+                p.circle_filled(point(19., 18.), 6.0 * scale, fill);
+                let mark = Stroke::new(1.7 * scale, mark);
+                p.line_segment([point(16., 18.), point(22., 18.)], mark);
+                p.line_segment([point(19., 15.), point(19., 21.)], mark);
             }
         }
         Icon::Folder => {
@@ -307,9 +320,52 @@ pub fn icon(p: &egui::Painter, rect: Rect, glyph: Icon, color: Color32) {
                 line(&[(7., 8.), (12., 3.), (17., 8.)]);
             }
         }
-        Icon::Replace | Icon::Convert => {
+        Icon::Convert => {
             line(&[(3., 7.), (21., 7.), (17., 3.)]);
             line(&[(21., 17.), (3., 17.), (7., 21.)]);
+        }
+        Icon::Replace => {
+            // A disk receiving an incoming arrow.
+            line(&[
+                (3., 9.),
+                (13., 9.),
+                (16., 12.),
+                (16., 21.),
+                (3., 21.),
+                (3., 9.),
+            ]);
+            box_at(6., 15., 7., 6.);
+            line(&[(10., 3.), (21., 3.), (21., 10.)]);
+            line(&[(18., 7.), (21., 10.), (24., 7.)]);
+        }
+        Icon::Swap => {
+            line(&[(8., 20.), (8., 4.)]);
+            line(&[(4., 8.), (8., 4.), (12., 8.)]);
+            line(&[(16., 4.), (16., 20.)]);
+            line(&[(12., 16.), (16., 20.), (20., 16.)]);
+        }
+        Icon::Format => {
+            line(&[
+                (4., 3.),
+                (17., 3.),
+                (21., 7.),
+                (21., 21.),
+                (3., 21.),
+                (3., 3.),
+                (4., 3.),
+            ]);
+            box_at(7., 3., 9., 6.);
+            for y in [14., 17.5] {
+                line(&[(7., y), (17., y)]);
+            }
+        }
+        Icon::Back => {
+            line(&[(21., 12.), (3., 12.)]);
+            line(&[(10., 5.), (3., 12.), (10., 19.)]);
+        }
+        Icon::Copy => {
+            box_at(8., 8., 13., 13.);
+            line(&[(16., 8.), (16., 3.), (3., 3.), (3., 16.), (8., 16.)]);
         }
         Icon::Trash => {
             line(&[(3., 6.), (21., 6.)]);
@@ -378,11 +434,13 @@ pub fn toolbar_button(
     primary: bool,
 ) -> Response {
     ui.add_enabled_ui(enabled, |ui| {
-        let (rect, response) = ui.allocate_exact_size(egui::vec2(76.0, 64.0), Sense::click());
+        let (rect, response) = ui.allocate_exact_size(egui::vec2(72.0, 64.0), Sense::click());
         response.widget_info(|| {
             egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
         });
-        let fill = if primary {
+        let fill = if primary && !ui.is_enabled() {
+            colors(ui.ctx()).pale
+        } else if primary {
             BLUE
         } else if response.hovered() || response.has_focus() {
             colors(ui.ctx()).pale
@@ -437,7 +495,7 @@ pub fn toolbar_menu(ui: &mut Ui, glyph: Icon, label: &str, hint: &str, enabled: 
             if enabled {
                 colors(ui.ctx()).muted
             } else {
-                colors(ui.ctx()).border
+                colors(ui.ctx()).disabled
             },
         ),
     );
@@ -445,65 +503,132 @@ pub fn toolbar_menu(ui: &mut Ui, glyph: Icon, label: &str, hint: &str, enabled: 
 }
 
 pub fn small_button(ui: &mut Ui, glyph: Icon, label: &str) -> Response {
-    let width = if label.is_empty() {
-        32.0
+    framed_button(ui, Some(glyph), label)
+}
+
+/// A framed secondary button without an icon, matching `small_button`.
+pub fn text_button(ui: &mut Ui, label: &str) -> Response {
+    framed_button(ui, None, label)
+}
+
+fn framed_button(ui: &mut Ui, glyph: Option<Icon>, label: &str) -> Response {
+    let c = colors(ui.ctx());
+    let text_width = if label.is_empty() {
+        0.0
     } else {
         ui.painter()
-            .layout_no_wrap(
-                label.into(),
-                FontId::proportional(13.0),
-                colors(ui.ctx()).ink,
-            )
+            .layout_no_wrap(label.into(), FontId::proportional(13.0), c.ink)
             .size()
             .x
-            + 44.0
+    };
+    let width = match (glyph.is_some(), label.is_empty()) {
+        (true, true) => 32.0,
+        (true, false) => text_width + 44.0,
+        (false, _) => text_width + 24.0,
     };
     let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 32.), Sense::click());
     response.widget_info(|| {
         egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
     });
-    ui.painter().rect_filled(
-        rect,
-        6,
-        if response.hovered() || response.has_focus() {
-            colors(ui.ctx()).pale
-        } else {
-            colors(ui.ctx()).surface
-        },
-    );
+    let enabled = ui.is_enabled();
+    let active = enabled && (response.hovered() || response.has_focus());
+    ui.painter()
+        .rect_filled(rect, 6, if active { c.pale } else { c.surface });
     ui.painter().rect_stroke(
         rect,
         6,
-        Stroke::new(
-            1.0f32,
-            if response.has_focus() {
-                BLUE
-            } else {
-                colors(ui.ctx()).border
-            },
-        ),
+        Stroke::new(1.0f32, if active { c.accent } else { c.border }),
         StrokeKind::Inside,
     );
-    icon(
-        ui.painter(),
-        Rect::from_min_size(rect.min + egui::vec2(7., 7.), Vec2::splat(18.)),
-        glyph,
-        if ui.is_enabled() {
-            colors(ui.ctx()).muted
-        } else {
-            colors(ui.ctx()).border
-        },
-    );
+    if let Some(glyph) = glyph {
+        icon(
+            ui.painter(),
+            Rect::from_min_size(rect.min + egui::vec2(7., 7.), Vec2::splat(18.)),
+            glyph,
+            if enabled { c.muted } else { c.disabled },
+        );
+    }
     if !label.is_empty() {
+        let (pos, align) = if glyph.is_some() {
+            (
+                rect.left_center() + egui::vec2(32., 0.),
+                egui::Align2::LEFT_CENTER,
+            )
+        } else {
+            (rect.center(), egui::Align2::CENTER_CENTER)
+        };
         ui.painter().text(
-            rect.left_center() + egui::vec2(32., 0.),
-            egui::Align2::LEFT_CENTER,
+            pos,
+            align,
             label,
             FontId::proportional(13.),
-            colors(ui.ctx()).ink,
+            if enabled { c.ink } else { c.disabled },
         );
     }
     response
+}
+
+/// The single emphasized action of a dialog.
+pub fn primary_button(ui: &mut Ui, label: &str, enabled: bool) -> Response {
+    let c = colors(ui.ctx());
+    let (fill, text) = if enabled {
+        (BLUE, Color32::WHITE)
+    } else {
+        (c.pale, c.disabled)
+    };
+    ui.add_enabled(
+        enabled,
+        egui::Button::new(egui::RichText::new(label).size(13.).strong().color(text))
+            .fill(fill)
+            .stroke(Stroke::NONE)
+            .corner_radius(6)
+            .min_size(egui::vec2(0., 32.)),
+    )
+}
+
+/// A destructive confirmation button (erase, overwrite).
+pub fn danger_button(ui: &mut Ui, label: &str) -> Response {
+    let c = colors(ui.ctx());
+    ui.add(
+        egui::Button::new(
+            egui::RichText::new(label)
+                .size(13.)
+                .strong()
+                .color(Color32::WHITE),
+        )
+        .fill(if ui.visuals().dark_mode {
+            Color32::from_rgb(176, 52, 68)
+        } else {
+            c.red
+        })
+        .stroke(Stroke::NONE)
+        .corner_radius(6)
+        .min_size(egui::vec2(0., 32.)),
+    )
+}
+
+/// A small sort-direction triangle drawn after a column header.
+pub fn sort_arrow(ui: &mut Ui, descending: bool) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(10., 10.), Sense::hover());
+    let c = rect.center();
+    let points = if descending {
+        vec![
+            c + egui::vec2(-4., -2.),
+            c + egui::vec2(4., -2.),
+            c + egui::vec2(0., 3.),
+        ]
+    } else {
+        vec![
+            c + egui::vec2(-4., 2.),
+            c + egui::vec2(4., 2.),
+            c + egui::vec2(0., -3.),
+        ]
+    };
+    ui.painter().add(egui::Shape::convex_polygon(
+        points,
+        colors(ui.ctx()).accent,
+        Stroke::NONE,
+    ));
 }
 
 pub fn nav_button(ui: &mut Ui, glyph: Icon, label: &str, active: bool) -> Response {
@@ -569,12 +694,10 @@ pub fn empty_art(ui: &mut Ui, glyph: Icon) {
         glyph,
         colors(ui.ctx()).accent,
     );
+    let dots = colors(ui.ctx()).accent.gamma_multiply(0.45);
     for (dx, dy, r) in [(-51., -24., 3.), (51., 12., 4.), (36., -38., 2.)] {
-        ui.painter().circle_filled(
-            center + egui::vec2(dx, dy),
-            r,
-            Color32::from_rgb(167, 188, 250),
-        );
+        ui.painter()
+            .circle_filled(center + egui::vec2(dx, dy), r, dots);
     }
 }
 

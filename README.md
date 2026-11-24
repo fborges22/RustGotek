@@ -15,8 +15,8 @@ cargo build --release
 ```
 
 Launching without arguments (or with `gui`) opens the egui desktop interface.
-The icon toolbar provides New disk, Import/New layout, Open, Export,
-Replace/Trash, Check, Backup, Convert and Device. The left navigation
+The icon toolbar provides New disk, Import/New layout, Load image, Open, Export,
+Swap, Format, Replace/Trash, Check, Backup, Convert and Device. The left navigation
 rail switches between the image library and USB banks. Icons have text labels,
 hover descriptions and keyboard focus indicators.
 
@@ -79,6 +79,18 @@ for changes. If the desktop reports no preference, System uses the light theme.
   `~/.local/share/RustGotek/recovery/` (`%APPDATA%\RustGotek\recovery` on Windows,
   `~/Library/Application Support/RustGotek/recovery` on macOS); click **Back** to
   choose another image or recovery location.
+- **Swap disks between slots:** select two banks (or one, then enter the other
+  number) and click **Swap**, or right-click and choose **Swap these two banks…**.
+  The review names both disks; both banks are saved as recovery images, then
+  written and verified, and both are restored if a write fails. In the image
+  library, selecting two indexed images (for example `DSKA0001.img` and
+  `DSKA0003.hfe`) and clicking **Swap** exchanges their slot numbers by renaming
+  them in place; if one slot is empty the image simply moves there.
+- **Format a disk:** select a bank or a raw floppy image (360/720/1200/1440/2880
+  KiB) and click **Format**, use **Format disk…** in the disk contents window, or
+  right-click it. Choose a disk label, review, and confirm with **Erase**. The
+  previous contents are saved as a recovery image first; the image keeps its
+  name and capacity.
 - **Drag and drop elsewhere:** dropping image files on the image library imports
   them into the open folder; dropping files while a disk's contents are open adds
   them to that disk (with the usual batch review).
@@ -209,7 +221,15 @@ The CLI requires the explicit confirmation flag:
 
 ```sh
 rustgotek bank-write /dev/sda gotek1440 1 ./replacement.img ./bank001.img ./bank001-recovery.img --confirm-write
+rustgotek bank-swap /dev/sda gotek1440 1 7 ./bank001-before.img ./bank007-before.img --confirm-write
+rustgotek bank-format /dev/sda gotek1440 1 "BLANK DISK" ./bank001-before.img --confirm-write
+rustgotek image-format ./disk.img - ./disk-before.img --confirm-write
+rustgotek slot-swap /media/USB 1 3
 ```
+
+`bank-swap` saves and verifies both originals before writing either bank.
+`bank-format` and `image-format` write a blank FAT12 disk (use `-` for no label)
+after saving the original. Recovery paths must be new files.
 
 The target must still match the exported original. Before writing, RustGotek
 saves, syncs and verifies the recovery image. It writes only the selected
