@@ -1809,7 +1809,7 @@ impl App {
                 visual::colors(ui.ctx()).muted,
             );
             ui.add(
-                egui::TextEdit::singleline(&mut self.filter)
+                visual::text_field(egui::TextEdit::singleline(&mut self.filter))
                     .id(egui::Id::new("disk-search"))
                     .hint_text("Search disks…")
                     .desired_width(210.),
@@ -1883,102 +1883,119 @@ impl App {
                 );
             }
         });
-        ui.horizontal_wrapped(|ui| {
-            let width = (ui.available_width() - if banks { 380. } else { 220. }).max(130.);
-            let response = if banks {
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.source)
-                        .hint_text(if cfg!(windows) {
-                            r"\\.\PhysicalDrive1, E: or a whole-device image"
+        // Buttons are laid out right-to-left first so the path field takes
+        // exactly the remaining width and the row never overflows the card.
+        let valid = if banks {
+            !self.source.trim().is_empty()
+        } else {
+            !self.root.trim().is_empty()
+        };
+        let mut response = None;
+        let mut clicked = false;
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), 32.),
+            egui::Layout::right_to_left(egui::Align::Center),
+            |ui| {
+                clicked = ui
+                    .add_enabled_ui(valid, |ui| {
+                        visual::small_button(
+                            ui,
+                            Icon::Refresh,
+                            if banks { "Scan banks" } else { "Refresh" },
+                        )
+                        .on_hover_text("Read the current source · F5")
+                    })
+                    .inner
+                    .clicked();
+                if banks {
+                    let old = self.profile.clone();
+                    egui::ComboBox::from_id_salt("bank-profile")
+                        .width(120.)
+                        .selected_text(if self.profile == "gotek1440" {
+                            "1.44 MB banks"
                         } else {
-                            "/dev/sda or a whole-device image"
+                            "720 KB banks"
                         })
-                        .desired_width(width),
-                )
-            } else {
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.root)
-                        .hint_text("Choose a folder of images")
-                        .desired_width(width),
-                )
-            };
-            if response.changed() {
-                self.clear();
-            }
-            let enter = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            if visual::small_button(ui, Icon::Folder, "Browse")
-                .on_hover_text("Choose a source · Ctrl/Cmd+O")
-                .clicked()
-            {
-                self.choose_source(ctx);
-            }
-            if banks {
-                let detect = visual::small_button(ui, Icon::Search, "Detect USB ▾");
-                if detect.clicked() {
-                    self.detected = crate::usb::detect();
-                }
-                egui::Popup::menu(&detect).show(|ui| {
-                    if self.detected.is_empty() {
-                        ui.label("No USB disks detected. Check that the drive is plugged in.");
-                    }
-                    let mut chosen = None;
-                    for (path, label) in &self.detected {
-                        if ui.button(label).clicked() {
-                            chosen = Some(path.clone());
-                        }
-                    }
-                    if let Some(path) = chosen {
-                        self.source = path;
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.profile,
+                                "gotek1440".into(),
+                                "1.44 MB banks",
+                            );
+                            ui.selectable_value(
+                                &mut self.profile,
+                                "gotek720".into(),
+                                "720 KB banks",
+                            );
+                        });
+                    if old != self.profile {
                         self.clear();
-                        self.status = "Ready to scan".into();
-                        ui.close();
                     }
-                    ui.separator();
-                    if ui.button("Search again").clicked() {
+                    let detect = visual::dropdown_button(ui, Icon::Search, "Detect USB");
+                    if detect.clicked() {
                         self.detected = crate::usb::detect();
                     }
-                });
-                detect.on_hover_text("List connected USB disks to use as the bank source");
-                let old = self.profile.clone();
-                egui::ComboBox::from_id_salt("bank-profile")
-                    .width(120.)
-                    .selected_text(if self.profile == "gotek1440" {
-                        "1.44 MB banks"
-                    } else {
-                        "720 KB banks"
-                    })
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.profile, "gotek1440".into(), "1.44 MB banks");
-                        ui.selectable_value(&mut self.profile, "gotek720".into(), "720 KB banks");
+                    egui::Popup::menu(&detect).show(|ui| {
+                        if self.detected.is_empty() {
+                            ui.label("No USB disks detected. Check that the drive is plugged in.");
+                        }
+                        let mut chosen = None;
+                        for (path, label) in &self.detected {
+                            if ui.button(label).clicked() {
+                                chosen = Some(path.clone());
+                            }
+                        }
+                        if let Some(path) = chosen {
+                            self.source = path;
+                            self.clear();
+                            self.status = "Ready to scan".into();
+                            ui.close();
+                        }
+                        ui.separator();
+                        if ui.button("Search again").clicked() {
+                            self.detected = crate::usb::detect();
+                        }
                     });
-                if old != self.profile {
-                    self.clear();
+                    detect.on_hover_text("List connected USB disks to use as the bank source");
                 }
-            }
-            let valid = if banks {
-                !self.source.trim().is_empty()
-            } else {
-                !self.root.trim().is_empty()
-            };
-            let clicked = ui
-                .add_enabled_ui(valid, |ui| {
-                    visual::small_button(
-                        ui,
-                        Icon::Refresh,
-                        if banks { "Scan banks" } else { "Refresh" },
+                if visual::small_button(ui, Icon::Folder, "Browse")
+                    .on_hover_text("Choose a source · Ctrl/Cmd+O")
+                    .clicked()
+                {
+                    self.choose_source(ctx);
+                }
+                let width = ui.available_width().max(120.);
+                response = Some(if banks {
+                    ui.add(
+                        visual::text_field(egui::TextEdit::singleline(&mut self.source))
+                            .hint_text(if cfg!(windows) {
+                                r"\\.\PhysicalDrive1, E: or a whole-device image"
+                            } else {
+                                "/dev/sda or a whole-device image"
+                            })
+                            .desired_width(width),
                     )
-                    .on_hover_text("Read the current source · F5")
-                })
-                .inner
-                .clicked();
-            if valid && (clicked || enter) {
-                if banks {
-                    self.scan(ctx);
                 } else {
-                    self.refresh(ctx);
-                }
+                    ui.add(
+                        visual::text_field(egui::TextEdit::singleline(&mut self.root))
+                            .hint_text("Choose a folder of images")
+                            .desired_width(width),
+                    )
+                });
+            },
+        );
+        let response = response.unwrap();
+        if response.changed() {
+            self.clear();
+        }
+        let enter = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        if valid && (clicked || enter) {
+            if banks {
+                self.scan(ctx);
+            } else {
+                self.refresh(ctx);
             }
-        });
+        }
         if let Some(listing) = &self.listing {
             let root = listing.root.clone();
             let dir = listing.directory.clone();
@@ -3454,7 +3471,7 @@ enum DiskEdit {
 impl DiskEdit {
     fn description(&self) -> String {
         match self {
-            Self::Import(source, name) => format!("Add {} → {name}", source.display()),
+            Self::Import(source, name) => format!("Add {} as {name}", source.display()),
             Self::Mkdir(name) => format!("Create folder {name}"),
             Self::Remove(name) => format!("Remove {name}"),
         }
@@ -5105,6 +5122,70 @@ mod tests {
         assert_eq!(form.command, "image-format");
         assert_eq!(form.values[1], "GAME DISK");
         assert!(app.review_summary(form)[1].contains("720 KiB"));
+    }
+    #[test]
+    fn workspace_fits_the_window_and_uses_only_available_glyphs() {
+        let ctx = egui::Context::default();
+        visual::apply(&ctx);
+        let mut app = app();
+        app.source.clear();
+        for workspace in [Workspace::Banks, Workspace::Images] {
+            app.workspace = workspace;
+            for width in [900.0f32, 1280.0] {
+                let mut output = None;
+                for _ in 0..3 {
+                    output = Some(ctx.run(
+                        egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(
+                                egui::Pos2::ZERO,
+                                egui::vec2(width, 760.0),
+                            )),
+                            ..Default::default()
+                        },
+                        |ctx| app.ui(ctx),
+                    ));
+                }
+                let shapes = output.unwrap().shapes;
+                for label in [
+                    "Browse",
+                    if workspace == Workspace::Banks {
+                        "Scan banks"
+                    } else {
+                        "Refresh"
+                    },
+                ] {
+                    let pos = text_position(&shapes, label)
+                        .unwrap_or_else(|| panic!("{label} not drawn"));
+                    assert!(
+                        pos.x < width - 20.,
+                        "{label} clipped at width {width}: {pos:?}"
+                    );
+                }
+                // Every text shape must be renderable with the bundled fonts.
+                fn texts(shape: &egui::Shape, out: &mut Vec<String>) {
+                    match shape {
+                        egui::Shape::Text(t) => out.push(t.galley.text().to_owned()),
+                        egui::Shape::Vec(v) => v.iter().for_each(|s| texts(s, out)),
+                        _ => {}
+                    }
+                }
+                let mut all = vec![];
+                shapes.iter().for_each(|s| texts(&s.shape, &mut all));
+                let font = egui::FontId::proportional(14.);
+                assert!(
+                    !ctx.fonts_mut(|f| f.has_glyph(&font, '▾')),
+                    "glyph check must detect missing glyphs"
+                );
+                for text in all {
+                    for c in text.chars().filter(|c| !c.is_ascii()) {
+                        assert!(
+                            ctx.fonts_mut(|f| f.has_glyph(&font, c)),
+                            "missing glyph {c:?} in {text:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
     #[test]
     fn operating_system_close_waits_for_active_operation() {

@@ -439,7 +439,7 @@ pub fn toolbar_button(
             egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
         });
         let fill = if primary && !ui.is_enabled() {
-            colors(ui.ctx()).pale
+            Color32::TRANSPARENT
         } else if primary {
             BLUE
         } else if response.hovered() || response.has_focus() {
@@ -483,35 +483,52 @@ pub fn toolbar_button(
 
 pub fn toolbar_menu(ui: &mut Ui, glyph: Icon, label: &str, hint: &str, enabled: bool) -> Response {
     let response = toolbar_button(ui, glyph, label, hint, enabled, false);
-    let center = response.rect.right_top() + egui::vec2(-9., 11.);
-    ui.painter().line(
-        vec![
-            center + egui::vec2(-3., -1.5),
-            center + egui::vec2(0., 1.5),
-            center + egui::vec2(3., -1.5),
-        ],
-        Stroke::new(
-            1.2f32,
-            if enabled {
-                colors(ui.ctx()).muted
-            } else {
-                colors(ui.ctx()).disabled
-            },
-        ),
+    chevron(
+        ui.painter(),
+        response.rect.right_top() + egui::vec2(-9., 11.),
+        if enabled {
+            colors(ui.ctx()).muted
+        } else {
+            colors(ui.ctx()).disabled
+        },
     );
     response
 }
 
 pub fn small_button(ui: &mut Ui, glyph: Icon, label: &str) -> Response {
-    framed_button(ui, Some(glyph), label)
+    framed_button(ui, Some(glyph), label, false)
 }
 
 /// A framed secondary button without an icon, matching `small_button`.
 pub fn text_button(ui: &mut Ui, label: &str) -> Response {
-    framed_button(ui, None, label)
+    framed_button(ui, None, label, false)
 }
 
-fn framed_button(ui: &mut Ui, glyph: Option<Icon>, label: &str) -> Response {
+/// A `small_button` that opens a menu, marked with a drawn chevron (the
+/// default fonts have no reliable down-triangle glyph).
+pub fn dropdown_button(ui: &mut Ui, glyph: Icon, label: &str) -> Response {
+    framed_button(ui, Some(glyph), label, true)
+}
+
+fn chevron(p: &egui::Painter, center: egui::Pos2, color: Color32) {
+    p.line(
+        vec![
+            center + egui::vec2(-3.5, -1.5),
+            center + egui::vec2(0., 2.),
+            center + egui::vec2(3.5, -1.5),
+        ],
+        Stroke::new(1.4f32, color),
+    );
+}
+
+/// Standard single-line field: same height and padding as the buttons.
+pub fn text_field(edit: egui::TextEdit<'_>) -> egui::TextEdit<'_> {
+    edit.margin(egui::Margin::symmetric(10, 7))
+        .min_size(egui::vec2(0., 32.))
+        .vertical_align(egui::Align::Center)
+}
+
+fn framed_button(ui: &mut Ui, glyph: Option<Icon>, label: &str, menu: bool) -> Response {
     let c = colors(ui.ctx());
     let text_width = if label.is_empty() {
         0.0
@@ -525,7 +542,7 @@ fn framed_button(ui: &mut Ui, glyph: Option<Icon>, label: &str) -> Response {
         (true, true) => 32.0,
         (true, false) => text_width + 44.0,
         (false, _) => text_width + 24.0,
-    };
+    } + if menu { 16.0 } else { 0.0 };
     let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 32.), Sense::click());
     response.widget_info(|| {
         egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
@@ -563,6 +580,13 @@ fn framed_button(ui: &mut Ui, glyph: Option<Icon>, label: &str) -> Response {
             label,
             FontId::proportional(13.),
             if enabled { c.ink } else { c.disabled },
+        );
+    }
+    if menu {
+        chevron(
+            ui.painter(),
+            rect.right_center() - egui::vec2(14., 0.),
+            if enabled { c.muted } else { c.disabled },
         );
     }
     response
@@ -674,13 +698,13 @@ pub fn nav_button(ui: &mut Ui, glyph: Icon, label: &str, active: bool) -> Respon
 }
 
 pub fn badge(ui: &mut Ui, label: &str, color: Color32, fill: Color32) {
-    egui::Frame::new()
-        .fill(fill)
-        .corner_radius(5)
-        .inner_margin(egui::Margin::symmetric(9, 4))
-        .show(ui, |ui| {
-            ui.label(egui::RichText::new(label).size(12.).color(color));
-        });
+    let galley = ui
+        .painter()
+        .layout_no_wrap(label.into(), FontId::proportional(11.5), color);
+    let (rect, _) = ui.allocate_exact_size(galley.size() + egui::vec2(18., 10.), Sense::hover());
+    ui.painter().rect_filled(rect, 5, fill);
+    ui.painter()
+        .galley(rect.center() - galley.size() / 2., galley, color);
 }
 
 pub fn empty_art(ui: &mut Ui, glyph: Icon) {
