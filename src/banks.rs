@@ -886,14 +886,144 @@ pub fn restore_device(target: &Path, image: &Path, expected: &Path, recovery: &P
     Ok(())
 }
 
+fn minimum_capacity(layout: Profile, count: u16) -> Result<u64> {
+    if !(1..=1000).contains(&count) {
+        return Err("bank count must be 1–1000".into());
+    }
+    Ok(layout.stride * u64::from(count))
+}
+
+// Supply one complete bank stride, including the zero-filled inter-bank gap.
+fn visit_banks(
+    layout: Profile,
+    count: u16,
+    blank: &[u8],
+    mut visit: impl FnMut(u16, &[u8]) -> Result<()>,
+) -> Result<()> {
+    let mut floppy = blank.to_vec();
+    floppy.resize(layout.stride as usize, 0);
+    let word = |at| u16::from_le_bytes([floppy[at], floppy[at + 1]]) as usize;
+    let root = (word(14) + floppy[16] as usize * word(22)) * 512;
+    let serial = u32::from_le_bytes(floppy[39..43].try_into()?);
+    for bank in 0..count {
+        let label = format!("FDISK{bank:03}   ");
+        floppy[43..54].copy_from_slice(label.as_bytes());
+        floppy[root..root + 11].copy_from_slice(label.as_bytes());
+        floppy[root + 11] = 0x08; // root volume label matches the BPB
+        floppy[39..43].copy_from_slice(&serial.wrapping_add(u32::from(bank)).to_le_bytes());
+        visit(bank, &floppy)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn check_usb_disk(metadata: &fs::Metadata) -> Result<()> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    if !metadata.file_type().is_block_device() {
+        return Err("select the whole USB disk listed by usb-list".into());
+    }
+    let number = metadata.rdev();
+    let node = fs::canonicalize(format!(
+        "/sys/dev/block/{}:{}",
+        libc::major(number),
+        libc::minor(number)
+    ))?;
+    if node.join("partition").try_exists()?
+        || !node.ancestors().any(|parent| {
+            fs::read_link(parent.join("subsystem")).is_ok_and(|link| link.ends_with("usb"))
+        })
+    {
+        return Err(
+            "initialization requires a whole USB disk; select the device shown by usb-list".into(),
+        );
+    }
+    Ok(())
+}
+
+fn open_usb_disk(path: &Path) -> Result<Box<dyn BankIo>> {
+    #[cfg(target_os = "linux")]
+    {
+        let metadata = fs::metadata(path)?;
+        check_usb_disk(&metadata)?;
+        let file = open_write_file(path)?;
+        use std::os::unix::fs::MetadataExt;
+        if file.metadata()?.rdev() != metadata.rdev() {
+            return Err("USB device changed while opening".into());
+        }
+        check_usb_disk(&file.metadata()?)?;
+        Ok(Box::new(file))
+    }
+    #[cfg(windows)]
+    {
+        if !crate::windev::is_device(path) {
+            return Err("choose a physical USB disk or drive letter".into());
+        }
+        Ok(Box::new(crate::windev::open_write(path)?))
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    {
+        let _ = path;
+        Err("direct USB initialization is supported on Linux and Windows".into())
+    }
+}
+
+pub fn initialize_usb(path: &Path, profile: &str, count: u16) -> Result<String> {
+    let layout = Profile::parse(profile)?;
+    let minimum = minimum_capacity(layout, count)?;
+    let mut target = open_usb_disk(path)?;
+    let size = target.seek(SeekFrom::End(0))?;
+    if size < minimum || !size.is_multiple_of(512) {
+        return Err(format!("USB capacity is {size} bytes; {count} banks need at least {minimum} bytes and a sector-aligned target").into());
+    }
+    write_usb_layout(&mut target, layout, count, size).map_err(|e| {
+        format!(
+            "USB initialization did not complete: {e}. Retry initialization before using the drive."
+        )
+    })?;
+    Ok(format!(
+        "Initialized {} with {count} blank {profile} banks. Verified all {size} bytes.",
+        path.display()
+    ))
+}
+
+fn write_usb_layout(
+    target: &mut impl BankIo,
+    layout: Profile,
+    count: u16,
+    size: u64,
+) -> Result<()> {
+    let blank = crate::fat12::formatted_image((layout.payload / 1024) as usize)?;
+    let zeros = vec![0; layout.stride as usize];
+    let stream = |chunk: &mut dyn FnMut(&[u8]) -> Result<()>| -> Result<()> {
+        visit_banks(layout, count, &blank, |_, bytes| chunk(bytes))?;
+        let mut left = size - layout.stride * u64::from(count);
+        while left > 0 {
+            let n = left.min(layout.stride) as usize;
+            chunk(&zeros[..n])?;
+            left -= n as u64;
+        }
+        Ok(())
+    };
+    target.rewind()?;
+    stream(&mut |bytes| Ok(target.write_all(bytes)?))?;
+    target.sync_bank()?;
+    target.rewind()?;
+    let mut actual = vec![0; zeros.len()];
+    stream(&mut |expected| {
+        let buffer = &mut actual[..expected.len()];
+        target.read_exact(buffer)?;
+        if buffer != expected {
+            return Err("USB contents differ on read-back".into());
+        }
+        Ok(())
+    })
+}
+
 /// Create a new superfloppy bank image. No MBR/partition table or firmware
 /// selector metadata: each bank starts directly at its fixed-stride offset.
 pub fn create_layout(dest: &Path, profile: &str, count: u16, capacity: &str) -> Result<()> {
     let layout = Profile::parse(profile)?;
-    if !(1..=1000).contains(&count) {
-        return Err("bank count must be 1–1000".into());
-    }
-    let minimum = layout.stride * u64::from(count);
+    let minimum = minimum_capacity(layout, count)?;
     let size = if capacity == "minimum" {
         minimum
     } else {
@@ -906,28 +1036,21 @@ pub fn create_layout(dest: &Path, profile: &str, count: u16, capacity: &str) -> 
         )
         .into());
     }
-    let mut floppy = crate::fat12::formatted_image((layout.payload / 1024) as usize)?;
-    let word = |at| u16::from_le_bytes([floppy[at], floppy[at + 1]]) as usize;
-    let root = (word(14) + floppy[16] as usize * word(22)) * 512;
-    let serial = u32::from_le_bytes(floppy[39..43].try_into()?);
+    let blank = crate::fat12::formatted_image((layout.payload / 1024) as usize)?;
     new_output(dest, |output| {
         // Extending a newly-created file yields zero gaps and tail bytes.
         // Some filesystems store these regions sparsely.
         output.set_len(size)?;
-        for bank in 0..count {
-            let label = format!("FDISK{bank:03}   ");
-            floppy[43..54].copy_from_slice(label.as_bytes());
-            floppy[root..root + 11].copy_from_slice(label.as_bytes());
-            floppy[root + 11] = 0x08; // root volume label matches the BPB
-            floppy[39..43].copy_from_slice(&serial.wrapping_add(u32::from(bank)).to_le_bytes());
+        visit_banks(layout, count, &blank, |bank, floppy| {
             let offset = u64::from(bank) * layout.stride;
             output.seek(SeekFrom::Start(offset))?;
-            output.write_all(&floppy)?;
+            let floppy = &floppy[..layout.payload as usize];
+            output.write_all(floppy)?;
             if read_bank(output, offset, floppy.len())? != floppy {
                 return Err(format!("bank {bank:03} creation read-back failed").into());
             }
-        }
-        Ok(())
+            Ok(())
+        })
     })?;
     println!(
         "Created {count} formatted {profile} banks in a new {size}-byte image. Labels FDISK000–FDISK{:03}; bank gaps and remaining capacity are zero. No bootable OS included.",
@@ -943,6 +1066,34 @@ pub fn create_layout(dest: &Path, profile: &str, count: u16, capacity: &str) -> 
 mod write_tests {
     use super::*;
     use std::io::Cursor;
+    #[test]
+    fn usb_initialization_replaces_old_partitions_banks_and_tail() {
+        for name in ["gotek1440", "gotek720"] {
+            let layout = Profile::parse(name).unwrap();
+            let size = 3 * layout.stride + 512;
+            let mut disk = tempfile::NamedTempFile::new().unwrap();
+            disk.write_all(&vec![0xab; size as usize]).unwrap();
+            write_usb_layout(disk.as_file_mut(), layout, 2, size).unwrap();
+            let table = catalog(disk.path(), name).unwrap();
+            assert_eq!(table.size, size);
+            assert_eq!(table.rows[0].label, "FDISK000");
+            assert_eq!(table.rows[1].label, "FDISK001");
+            assert!(!table.rows[2].recognized);
+            let bytes = fs::read(disk.path()).unwrap();
+            for n in 0..2 {
+                let start = n * layout.stride as usize;
+                let end = start + layout.payload as usize;
+                crate::fat12::inspect(&bytes[start..end]).unwrap();
+                assert!(
+                    bytes[end..start + layout.stride as usize]
+                        .iter()
+                        .all(|b| *b == 0)
+                );
+            }
+            assert!(bytes[2 * layout.stride as usize..].iter().all(|b| *b == 0));
+        }
+    }
+
     #[test]
     fn streaming_restore_recovers_after_a_partial_chunk_write() {
         let size = 2 * 1024 * 1024 + 19;

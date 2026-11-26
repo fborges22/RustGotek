@@ -1,3 +1,4 @@
+use crate::operations::{Kind, OPS, Operation, Page};
 mod appearance;
 mod chrome;
 mod visual;
@@ -43,496 +44,6 @@ pub fn launch(bank_source: Option<String>) -> eframe::Result {
         }),
     )
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Page {
-    Media,
-    Banks,
-    Slots,
-    Images,
-    Backups,
-    Config,
-    Firmware,
-}
-#[derive(Debug, Clone, Copy)]
-enum Kind {
-    Text,
-    File,
-    Folder,
-    Save,
-}
-struct Field {
-    label: &'static str,
-    kind: Kind,
-    default: &'static str,
-}
-struct Operation {
-    page: Page,
-    title: &'static str,
-    command: &'static str,
-    description: &'static str,
-    media: bool,
-    writes_media: bool,
-    confirm: bool,
-    fields: &'static [Field],
-}
-macro_rules! field {
-    ($label:literal, $kind:ident, $default:literal) => {
-        Field {
-            label: $label,
-            kind: Kind::$kind,
-            default: $default,
-        }
-    };
-}
-macro_rules! op {
-    ($page:ident, $title:literal, $cmd:literal, $desc:literal, $media:literal, $write:literal, $confirm:literal, [$($field:expr),*]) => {
-
-        Operation { page: Page::$page, title: $title, command: $cmd, description: $desc,
-            media: $media, writes_media: $write, confirm: $confirm, fields: &[$($field),*] }
-    };
-}
-static OPS: &[Operation] = &[
-    op!(
-        Media,
-        "Media report",
-        "media-info",
-        "Inspect image inventory and FlashFloppy configuration in the open folder.",
-        true,
-        false,
-        false,
-        []
-    ),
-    op!(
-        Banks,
-        "Inspect bank headers",
-        "bank-list",
-        "Choose a raw device (for example /dev/sda) or a whole-device backup. gotek1440 uses 1536 KiB spacing; gotek720 uses 1024 KiB. Confirm the layout for your model. Linux may request read authorization in a system dialog; Windows needs administrator rights. Header matches are not filesystem validation.",
-        false,
-        false,
-        false,
-        [
-            field!("Device or whole-device backup", File, ""),
-            field!("Bank profile: gotek1440 or gotek720", Text, "gotek1440")
-        ]
-    ),
-    op!(
-        Banks,
-        "Export a floppy bank",
-        "bank-export",
-        "Copy the selected bank to a new image without changing the source. Bank numbers start at 0. Use Disk images to inspect or edit the exported image.",
-        false,
-        false,
-        false,
-        [
-            field!("Device or whole-device backup", File, ""),
-            field!("Bank profile: gotek1440 or gotek720", Text, "gotek1440"),
-            field!("Bank number (0–999)", Text, "0"),
-            field!("New floppy image", Save, "")
-        ]
-    ),
-    op!(
-        Banks,
-        "Back up the whole device",
-        "bank-backup",
-        "Copy every byte, including all banks, padding and trailing data. The destination needs space for the entire USB capacity. Keep the source unmounted or read-only during copying.",
-        false,
-        false,
-        false,
-        [
-            field!("Device or whole-device backup", File, ""),
-            field!("New whole-device backup", Save, "")
-        ]
-    ),
-    op!(
-        Banks,
-        "Verify a whole-device backup",
-        "bank-verify",
-        "Compare every byte of the device or image with its backup. Keep the source unchanged during verification.",
-        false,
-        false,
-        false,
-        [
-            field!("Device or whole-device image", File, ""),
-            field!("Whole-device backup", File, "")
-        ]
-    ),
-    op!(
-        Banks,
-        "Replace a bank in a backup copy",
-        "bank-replace",
-        "Create a new whole-device image containing the replacement floppy. Preserve other banks and padding. The USB and original backup remain unchanged. Use Restore a whole-device image to write the completed backup to a matching-capacity device.",
-        false,
-        false,
-        false,
-        [
-            field!("Original whole-device backup", File, ""),
-            field!("Bank profile: gotek1440 or gotek720", Text, "gotek1440"),
-            field!("Bank number (0–999)", Text, "0"),
-            field!("Replacement floppy image", File, ""),
-            field!("New whole-device image", Save, "")
-        ]
-    ),
-    op!(
-        Banks,
-        "Write a replacement to a bank",
-        "bank-write",
-        "Replace one bank on a USB device (unmounted on Linux; locked automatically on Windows) or image file. First export the selected bank as the expected original. A new recovery image is saved before writing. Confirm the target, profile and bank below; Linux may request authorization and Windows needs administrator rights. Power loss can interrupt recovery.",
-        false,
-        false,
-        true,
-        [
-            field!("Target device or whole-device image", File, ""),
-            field!("Bank profile: gotek1440 or gotek720", Text, "gotek1440"),
-            field!("Bank number (0–999)", Text, "0"),
-            field!("Replacement floppy image", File, ""),
-            field!("Expected original (exported bank)", File, ""),
-            field!("New recovery image", Save, "")
-        ]
-    ),
-    op!(
-        Banks,
-        "Restore a whole-device image",
-        "device-restore",
-        "Replace every byte of a USB device (unmounted on Linux; locked automatically on Windows) or existing image file. The replacement and expected original backups must exactly match its capacity. Save a new full recovery copy before writing; allow space for the entire device. Confirm all paths before proceeding.",
-        false,
-        false,
-        true,
-        [
-            field!("Target device or existing whole-device image", File, ""),
-            field!("Whole-device image to restore", File, ""),
-            field!("Expected original whole-device backup", File, ""),
-            field!("New whole-device recovery file", Save, "")
-        ]
-    ),
-    op!(
-        Banks,
-        "Create a new bank layout",
-        "bank-create",
-        "Create a new image containing blank FAT12 floppies labelled FDISK000 onwards. Gaps and unused capacity are zero. Choose the bank count supported by your emulator. For USB restoration, enter its exact capacity from Inspect bank headers. No USB is modified by this operation.",
-        false,
-        false,
-        false,
-        [
-            field!("New whole-device image", Save, ""),
-            field!("Bank profile: gotek1440 or gotek720", Text, "gotek1440"),
-            field!("Number of banks (1–1000)", Text, "100"),
-            field!("Total capacity in bytes, or minimum", Text, "minimum")
-        ]
-    ),
-    op!(
-        Slots,
-        "List assigned slots",
-        "slots",
-        "Show the indexed prefix, occupied slots and conflicts.",
-        true,
-        false,
-        false,
-        []
-    ),
-    op!(
-        Slots,
-        "Assign a disk image",
-        "slot",
-        "Copy an image to a numbered slot. Existing slots are never replaced.",
-        true,
-        true,
-        false,
-        [
-            field!("Disk image", File, ""),
-            field!("Slot number (0–999) or auto", Text, "auto")
-        ]
-    ),
-    op!(
-        Slots,
-        "Move a slot",
-        "slot-move",
-        "Verify the new copy before removing the old slot name.",
-        true,
-        true,
-        true,
-        [
-            field!("Current slot", Text, "0"),
-            field!("New slot", Text, "1")
-        ]
-    ),
-    op!(
-        Slots,
-        "Swap two slots",
-        "slot-swap",
-        "Exchange two indexed images by renaming them in place; no data is copied. If one slot is empty, the image simply moves there.",
-        true,
-        true,
-        true,
-        [
-            field!("First slot", Text, "0"),
-            field!("Second slot", Text, "1")
-        ]
-    ),
-    op!(
-        Images,
-        "Create a PC floppy",
-        "create-fat12",
-        "Create a formatted FAT12 data image. No operating system is included.",
-        false,
-        false,
-        false,
-        [
-            field!("Save edited copy as", Save, ""),
-            field!("Capacity in KiB: 360, 720, 1200, 1440, 2880", Text, "1440")
-        ]
-    ),
-    op!(
-        Images,
-        "Check a FAT12 image",
-        "image-check",
-        "Check allocations, sector layout, file chains and directory links.",
-        false,
-        false,
-        false,
-        [field!("Disk image", File, "")]
-    ),
-    op!(
-        Images,
-        "Inspect FAT12 layout",
-        "inspect-fat12",
-        "Show geometry and free space.",
-        false,
-        false,
-        false,
-        [field!("Disk image", File, "")]
-    ),
-    op!(
-        Images,
-        "Inspect an HFE image",
-        "inspect-hfe",
-        "Check the HFE container and track extents.",
-        false,
-        false,
-        false,
-        [field!("HFE image", File, "")]
-    ),
-    op!(
-        Images,
-        "Browse an image directory",
-        "image-list",
-        "List FAT12 contents using DOS short names.",
-        false,
-        false,
-        false,
-        [
-            field!("Disk image", File, ""),
-            field!("Directory inside image", Text, "/")
-        ]
-    ),
-    op!(
-        Images,
-        "Extract a file",
-        "image-extract",
-        "Copy a FAT12 file out of its image without mounting it.",
-        false,
-        false,
-        false,
-        [
-            field!("Disk image", File, ""),
-            field!("File inside image", Text, ""),
-            field!("Save extracted file", Save, "")
-        ]
-    ),
-    op!(
-        Images,
-        "Change disk label",
-        "image-label",
-        "Give this disk a recognizable DOS label (up to 11 characters). The original image is preserved.",
-        false,
-        false,
-        false,
-        [
-            field!("Original image", File, ""),
-            field!("Disk label", Text, ""),
-            field!("Save edited copy as", Save, "")
-        ]
-    ),
-    op!(
-        Images,
-        "Add a file",
-        "image-import",
-        "Save an edited copy of a FAT12 image; the original is preserved.",
-        false,
-        false,
-        false,
-        [
-            field!("Original image", File, ""),
-            field!("File to add", File, ""),
-            field!("DOS 8.3 path inside image", Text, ""),
-            field!("Save edited copy as", Save, "")
-        ]
-    ),
-    op!(
-        Images,
-        "New folder",
-        "image-mkdir",
-        "Create a directory in a new copy of the FAT12 image.",
-        false,
-        false,
-        false,
-        [
-            field!("Original image", File, ""),
-            field!("DOS 8.3 directory path", Text, ""),
-            field!("Save edited copy as", Save, "")
-        ]
-    ),
-    op!(
-        Images,
-        "Remove file or folder",
-        "image-remove",
-        "Remove a file or empty directory in a new copy. Original is preserved.",
-        false,
-        false,
-        false,
-        [
-            field!("Original image", File, ""),
-            field!("Path inside image", Text, ""),
-            field!("Save edited copy as", Save, "")
-        ]
-    ),
-    op!(
-        Images,
-        "Rename file or folder",
-        "image-rename",
-        "Rename a file or directory within its parent in a new copy.",
-        false,
-        false,
-        false,
-        [
-            field!("Original image", File, ""),
-            field!("Path inside image", Text, ""),
-            field!("New DOS 8.3 name", Text, ""),
-            field!("Save edited copy as", Save, "")
-        ]
-    ),
-    op!(
-        Images,
-        "Convert raw image to HFE",
-        "convert-hfe",
-        "Encode PC sectors as HFE v1 IBM MFM tracks.",
-        false,
-        false,
-        false,
-        [
-            field!("Raw image", File, ""),
-            field!("New HFE image", Save, ""),
-            field!("Profile: pc360, pc720, pc1200, pc1440", Text, "pc1440")
-        ]
-    ),
-    op!(
-        Images,
-        "Convert HFE to raw image",
-        "convert-raw",
-        "Decode standard PC HFE v1 sectors, checking IDs and CRCs.",
-        false,
-        false,
-        false,
-        [
-            field!("HFE image", File, ""),
-            field!("New raw image", Save, ""),
-            field!("Profile: pc360, pc720, pc1200, pc1440", Text, "pc1440")
-        ]
-    ),
-    op!(
-        Backups,
-        "Back up media files",
-        "backup",
-        "Copy and verify the mounted filesystem. This does not back up hidden raw disk banks or boot sectors.",
-        true,
-        false,
-        false,
-        [field!(
-            "New backup directory (must not already exist)",
-            Save,
-            ""
-        )]
-    ),
-    op!(
-        Backups,
-        "Verify a backup",
-        "verify",
-        "Compare directory trees and every file byte.",
-        true,
-        false,
-        false,
-        [field!("Existing backup directory", Folder, "")]
-    ),
-    op!(
-        Backups,
-        "Restore to a new directory",
-        "restore",
-        "Copy and verify a backup into a new directory. Existing directories are never merged or overwritten.",
-        false,
-        false,
-        false,
-        [
-            field!("Backup directory", Folder, ""),
-            field!("New destination directory", Save, "")
-        ]
-    ),
-    op!(
-        Config,
-        "View FlashFloppy settings",
-        "config-show",
-        "Read the active FF.CFG, including the FF subdirectory when present.",
-        true,
-        false,
-        false,
-        []
-    ),
-    op!(
-        Config,
-        "Change a setting",
-        "config-set",
-        "Save a numbered backup before updating one option. Values depend on your firmware version.",
-        true,
-        true,
-        false,
-        [
-            field!("Setting name", Text, "nav-mode"),
-            field!("Value", Text, "indexed")
-        ]
-    ),
-    op!(
-        Config,
-        "Initialize FlashFloppy configuration",
-        "init",
-        "Create FF.CFG only when no active configuration exists. This does not install firmware.",
-        true,
-        true,
-        false,
-        [field!("Navigation mode: native or indexed", Text, "native")]
-    ),
-    op!(
-        Firmware,
-        "Inspect an update",
-        "firmware-inspect",
-        "Validate FlashFloppy update checksums and show MCU payloads. CRCs do not prove authenticity.",
-        false,
-        false,
-        false,
-        [field!("Update file (.upd)", File, "")]
-    ),
-    op!(
-        Firmware,
-        "Stage a firmware update",
-        "firmware-stage",
-        "Copy a trusted FlashFloppy update to USB for an explicit MCU. The device is not flashed by this application.",
-        true,
-        true,
-        true,
-        [
-            field!("Update file (.upd)", File, ""),
-            field!("MCU: stm32f105, at32f415 or at32f435", Text, "")
-        ]
-    ),
-];
-
 #[derive(Debug, Clone)]
 struct Entry {
     name: String,
@@ -671,6 +182,14 @@ impl Form {
             return Err("Complete all fields before continuing".into());
         }
         match self.command.as_str() {
+            "usb-init" => {
+                if !self.values[2]
+                    .parse::<u16>()
+                    .is_ok_and(|n| (1..=1000).contains(&n))
+                {
+                    return Err("Enter a bank count from 1 to 1000".into());
+                }
+            }
             "image-label" => {
                 crate::fat12::encode_label(&self.values[1]).map_err(|e| e.to_string())?;
             }
@@ -708,10 +227,7 @@ impl Form {
             args.push(root.into());
         }
         args.extend(values);
-        if matches!(
-            self.command.as_str(),
-            "bank-write" | "device-restore" | "bank-swap" | "bank-format" | "image-format"
-        ) {
+        if crate::operations::requires_write_flag(&self.command) {
             args.push("--confirm-write".into());
         }
         Ok(args)
@@ -724,6 +240,7 @@ enum Event {
     Prepared(Form),
     FormFailed(Form, String),
     Done(String),
+    UsbInitialized(String, String, String),
     Edited(Preview, String),
     Picked(usize, Option<PathBuf>),
     Folder(Option<PathBuf>),
@@ -946,6 +463,15 @@ impl App {
                     self.show_log = true;
                     self.refresh(ctx);
                 }
+                Ok(Event::UsbInitialized(source, profile, output)) => {
+                    self.clear();
+                    self.source = source;
+                    self.profile = profile;
+                    self.workspace = Workspace::Banks;
+                    self.log = output;
+                    self.show_log = true;
+                    self.scan(ctx);
+                }
                 Ok(Event::Done(output)) => {
                     self.log = output;
                     self.status = "Operation completed".into();
@@ -1072,6 +598,10 @@ impl App {
             let mut form = Form::operation(op);
             form.recovery = self.save_recovery;
             let selected = self.selection();
+            if command == "usb-init" {
+                form.values[0] = self.source.clone();
+                form.values[1] = self.profile.clone();
+            }
             if command == "device-restore" {
                 form.values[0] = self.source.clone();
             }
@@ -1107,7 +637,7 @@ impl App {
             } else if !op.media
                 && !matches!(
                     command,
-                    "create-fat12" | "create" | "restore" | "device-restore"
+                    "create-fat12" | "create" | "restore" | "device-restore" | "usb-init"
                 )
                 && let Some(row) = selected.first()
                 && row.bank.is_none()
@@ -1357,6 +887,11 @@ impl App {
         self.worker(ctx, &format!("{}…", form.title), move || {
             let _keepalive = keepalive;
             let result = (|| {
+                if args[0] == "usb-init" {
+                    let source = args[1].clone();
+                    let profile = args[2].clone();
+                    return Ok(Event::UsbInitialized(source, profile, backend(args)?));
+                }
                 let output = if args[0] == "gui-replace-bank" {
                     let temp = tempfile::tempdir().map_err(|e| e.to_string())?;
                     let image = raw_for_bank(Path::new(&args[4]), &args[2], temp.path())?;
@@ -2380,6 +1915,10 @@ impl App {
         }
         ui.separator();
         if self.workspace == Workspace::Banks {
+            #[cfg(any(target_os = "linux", windows))]
+            if menu_item(ui, "Initialize USB drive…", true) {
+                self.open_form("usb-init");
+            }
             if menu_item(ui, "Refresh bank table", !self.source.trim().is_empty()) {
                 self.scan(ctx);
             }
@@ -2400,6 +1939,7 @@ impl App {
         } else {
             if menu_item(ui, "Media report", self.listing.is_some()) {
                 self.open_form("media-info");
+                self.execute_form(ctx);
             }
             ui.separator();
             ui.menu_button("Indexed slots", |ui| self.category_menu(ui, Page::Slots));
@@ -2424,6 +1964,9 @@ impl App {
                 && (!op.writes_media || !self.listing.as_ref().is_some_and(|l| l.read_only));
             if menu_item(ui, op.title, available) {
                 self.open_form(op.command);
+                if op.fields.is_empty() && !op.confirm && !op.writes_media {
+                    self.execute_form(ui.ctx());
+                }
             }
         }
         if self.workspace != Workspace::Images || self.listing.is_none() {
@@ -2445,7 +1988,7 @@ impl App {
             values: vec![row.key.clone()],
             media: true,
             writes_media: true,
-            confirm: true,
+            confirm: false,
             review: false,
             keepalive: None,
             editor: None,
@@ -2636,10 +2179,6 @@ impl App {
                     "Every file on this disk is erased. The image keeps its name and capacity.".into(),
                 ]
             }
-            "slot-swap" => vec![
-                format!("Swap slots {:0>4} and {:0>4} in {}", v[0].trim(), v[1].trim(), self.root),
-                "Images are renamed in place; their contents are not copied or changed. The Gotek shows each image under its new slot number.".into(),
-            ],
             _ => vec![],
         }
     }
@@ -3014,19 +2553,15 @@ impl App {
                                         v[2].trim(),
                                         v[3].trim()
                                     ),
-                                    "slot-swap" => format!(
-                                        "Swap slots {:0>4} and {:0>4}",
-                                        v[0].trim(),
-                                        v[1].trim()
-                                    ),
                                     "bank-format" => format!("Erase bank {:0>3}", v[2].trim()),
+                                    "usb-init" => "Erase and initialize USB drive".to_string(),
                                     "image-format" => "Erase and format disk".to_string(),
                                     _ => "Confirm and run".to_string(),
                                 }
                             };
                             let destructive = matches!(
                                 form.command.as_str(),
-                                "bank-format" | "image-format" | "remove" | "device-restore"
+                                "bank-format" | "image-format" | "remove" | "device-restore" | "usb-init"
                             );
                             let clicked = if destructive {
                                 visual::danger_button(ui, &label).clicked()
@@ -3160,6 +2695,12 @@ impl App {
                                 "Continue…"
                             } else if form.confirm {
                                 "Review changes…"
+                            } else if form.command == "slot-move" {
+                                "Move slot"
+                            } else if form.command == "slot-swap" {
+                                "Swap slots"
+                            } else if form.command == "remove" {
+                                "Move to trash"
                             } else if form.command == "create-fat12" {
                                 "Create disk"
                             } else if matches!(
@@ -4122,6 +3663,9 @@ fn backend(args: Vec<String>) -> Result<String, String> {
     let words: Vec<_> = args.iter().map(String::as_str).collect();
     let device_operation = || -> crate::Result<Option<String>> {
         let message = match words.as_slice() {
+            ["usb-init", target, profile, count, "--confirm-write"] => {
+                crate::banks::initialize_usb(Path::new(target), profile, count.parse()?)?
+            }
             ["bank-export", source, profile, bank, dest] => {
                 crate::banks::export(Path::new(source), profile, bank.parse()?, Path::new(dest))?;
                 format!("Exported bank {bank} to {dest}")
@@ -4778,13 +4322,31 @@ mod tests {
     }
 
     #[test]
+    fn recoverable_library_actions_submit_from_the_form() {
+        let mut app = app();
+        for command in ["slot-move", "slot-swap"] {
+            app.open_form(command);
+            assert!(!app.form.as_ref().unwrap().confirm);
+        }
+        app.trash_form(&editor_row(Path::new("disk.img"), None));
+        assert!(!app.form.as_ref().unwrap().confirm);
+    }
+
+    #[test]
     fn writes_wait_for_review_and_cancel_discards_them() {
         let ctx = egui::Context::default();
-        for command in ["bank-write", "device-restore"] {
+        let mut commands = vec!["bank-write", "device-restore"];
+        if cfg!(any(target_os = "linux", windows)) {
+            commands.push("usb-init");
+        }
+        for command in commands {
             let mut app = app();
             app.open_form(command);
             let form = app.form.as_mut().unwrap();
             form.values.iter_mut().for_each(|v| *v = "example".into());
+            if command == "usb-init" {
+                form.values[2] = "100".into();
+            }
             assert!(form.confirm);
             assert_eq!(form.args("").unwrap().last().unwrap(), "--confirm-write");
             app.execute_form(&ctx);

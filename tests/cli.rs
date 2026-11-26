@@ -7,6 +7,33 @@ use std::{
 static ID: AtomicUsize = AtomicUsize::new(0);
 
 #[test]
+fn usb_initialization_requires_confirmation_and_a_whole_usb_device() {
+    let s = Sandbox::new();
+    let image = s.0.join("existing.img");
+    fs::write(&image, b"original data").unwrap();
+    for args in [
+        vec!["usb-init", "existing.img", "gotek720", "1"],
+        vec![
+            "usb-init",
+            "existing.img",
+            "gotek720",
+            "1",
+            "--confirm-write",
+        ],
+        vec![
+            "usb-init",
+            "existing.img",
+            "gotek720",
+            "0",
+            "--confirm-write",
+        ],
+    ] {
+        assert!(!s.run(&args).status.success());
+        assert_eq!(fs::read(&image).unwrap(), b"original data");
+    }
+}
+
+#[test]
 fn media_report_distinguishes_files_from_installed_firmware() {
     let s = Sandbox::new();
     fs::create_dir_all(s.0.join("usb/ff")).unwrap();

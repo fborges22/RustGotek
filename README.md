@@ -14,6 +14,13 @@ cargo build --release
 ./target/release/rustgotek
 ```
 
+Run `rustgotek tui` for the interactive terminal utility. Use the arrow keys
+and Enter to choose an operation. Press Esc or q to go back or quit. At a
+field, Enter accepts the displayed default and `:back` cancels. The terminal
+menu includes FAT12 image creation and editing, USB discovery, bank operations,
+backups, indexed slots, and FlashFloppy settings and firmware staging.
+Results stay in the terminal scrollback.
+
 Launching without arguments (or with `gui`) opens the egui desktop interface.
 The icon toolbar provides New disk, Import/New layout, Load image, Open, Export,
 Swap, Format, Replace/Trash, Check, Backup, Convert and Device. The left navigation
@@ -131,8 +138,10 @@ rustgotek usb-eject /media/USB --confirm-eject
 Operations run on background threads. Results appear in the activity log with a
 copy button, and file/folder inputs have native pickers. Existing output files
 are never overwritten by export and copy operations. Disk-editor saves update
-existing disks directly. Media changes such as explicit bank replacement, full-device
-restore and moving an image to trash require a review and confirmation.
+existing disks directly. Bank replacement and full-device restore show the target and recovery details
+for review. Slot moves, slot swaps and moving a selected image to recoverable
+trash take one action from the desktop form. Media reports, slot listings and
+configuration views open directly from the Device menu.
 
 On Linux, read-only mounts disable media write actions. The image library takes
 a directory; the bank workspace takes a raw device or whole-device image.
@@ -299,6 +308,33 @@ extra selector metadata. This follows the formatting approach used by
 [usbfd](https://github.com/dennisMe2/usbfd/blob/master/usbfd); other Gotek firmware
 layouts are not inferred. Generated disks pass independent FAT checks, but
 acceptance by your emulator still requires a hardware test.
+
+### Initialize a new USB flash drive
+
+**Original Gotek firmware (fixed-stride banks, Linux or Windows).** In the
+desktop app, open **Gotek USB banks**, use **Detect USB** to select the stick,
+then choose **Device → Initialize USB drive**. In `rustgotek tui`, choose
+**Gotek USB banks → Initialize USB drive**. Select the profile and bank count
+your Gotek supports. Review the whole-drive path before accepting the erase.
+
+Initialization replaces **all partitions and files** with blank FAT12 floppies
+labelled `FDISK000` onwards. It clears unused space and reads the full drive
+back for verification, so large sticks take longer. Back up any files you need
+first. Unmount all volumes on Linux and leave the stick connected. On Windows,
+run as administrator and close applications using the drive.
+
+The CLI takes the whole-device path reported by `usb-list`. For example, with
+a verified target in place of `DEVICE` and a 100-bank 1.44 MB Gotek:
+
+```sh
+rustgotek usb-list
+rustgotek usb-init DEVICE gotek1440 100 --confirm-write
+```
+
+**FlashFloppy firmware.** Start with a mounted FAT32 USB stick. Choose
+**Initialize FlashFloppy configuration** in the FlashFloppy settings menu.
+For indexed mode, add your first image with `rustgotek slot /media/USB disk.img 0`.
+This workflow stores floppy images as ordinary files.
 
 Example workflow (replace `/media/USB` with the mounted USB directory):
 

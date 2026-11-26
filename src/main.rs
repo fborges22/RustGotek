@@ -6,7 +6,9 @@ mod firmware;
 mod gui;
 mod hfe;
 mod media;
+mod operations;
 mod slots;
+mod tui;
 mod usb;
 #[cfg(windows)]
 mod windev;
@@ -25,8 +27,11 @@ const HELP: &str = "rustgotek — manage mounted Gotek USB media
 Commands:
   gui                              Open the desktop interface (also the default)
   gui banks [SOURCE]               Open Disk banks, optionally prefill the source
+  tui                              Open the interactive terminal menu
   usb-list                         List connected USB disks usable as a bank source
   usb-eject SOURCE --confirm-eject Unmount and power off a USB drive (Linux)
+  usb-init DEVICE PROFILE COUNT --confirm-write
+                                   Erase a whole USB drive and create blank Gotek banks
   bank-list SOURCE PROFILE         Inspect fixed-stride bank boot headers
   bank-create OUT PROFILE COUNT CAPACITY_BYTES|minimum
                                    Create a new formatted bank-layout image
@@ -303,6 +308,7 @@ fn run(a: &[String]) -> Result<()> {
             usb::power_off(&plan)?;
             println!("USB powered off. Safe to unplug.");
         }
+        ["tui"] => tui::launch()?,
         ["usb-list"] => {
             let found = usb::detect();
             if found.is_empty() {
@@ -313,6 +319,12 @@ fn run(a: &[String]) -> Result<()> {
             }
         }
         ["bank-list", source, profile] => banks::list(Path::new(source), profile)?,
+        ["usb-init", device, profile, count, "--confirm-write"] => {
+            println!(
+                "{}",
+                banks::initialize_usb(Path::new(device), profile, count.parse()?)?
+            );
+        }
         ["bank-create", dest, profile, count, capacity] => {
             banks::create_layout(Path::new(dest), profile, count.parse()?, capacity)?
         }
